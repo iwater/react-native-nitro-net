@@ -1,0 +1,59 @@
+{
+    "name": "react-native-nitro-net",
+    "version": "0.1.5",
+    "description": "Ultra-high-performance networking to React Native by combining a memory-safe Rust core with the zero-overhead Nitro Modules JSI bridge. Provides Node.js-compatible net API.",
+    "main": "./lib/index.js",
+    "module": "./lib/index.js",
+    "types": "./lib/index.d.ts",
+    "keywords": [
+        "react-native",
+        "ios",
+        "android",
+        "nitro",
+        "net",
+        "socket",
+        "tcp"
+    ],
+    "author": "iwater <iwater@gmail.com>",
+    "license": "ISC",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/iwater/react-native-nitro-net.git"
+    },
+    "bugs": {
+        "url": "https://github.com/iwater/react-native-nitro-net/issues"
+    },
+    "scripts": {
+        "build": "npx nitrogen@0.32.0 && tsc",
+        "prepare": "npm run build",
+        "copy-clib": "rm -rf ios/Frameworks/RustCNet.xcframework && cp -R ../rust_c_net/target/xcframework/RustCNet.xcframework ios/Frameworks/ && mkdir -p android/libs/arm64-v8a android/libs/armeabi-v7a android/libs/x86 android/libs/x86_64 && cp ../rust_c_net/target/aarch64-linux-android/release/librust_c_net.so android/libs/arm64-v8a/ && cp ../rust_c_net/target/armv7-linux-androideabi/release/librust_c_net.so android/libs/armeabi-v7a/ && cp ../rust_c_net/target/i686-linux-android/release/librust_c_net.so android/libs/x86/ && cp ../rust_c_net/target/x86_64-linux-android/release/librust_c_net.so android/libs/x86_64/ && cp ../rust_c_net/include/NetBindings.hpp cpp/",
+        "copy-clib-android": "cp ../rust_c_net/target/aarch64-linux-android/release/librust_c_net.so android/libs/arm64-v8a/ && cp ../rust_c_net/target/armv7-linux-androideabi/release/librust_c_net.so android/libs/armeabi-v7a/ && cp ../rust_c_net/target/i686-linux-android/release/librust_c_net.so android/libs/x86/ && cp ../rust_c_net/target/x86_64-linux-android/release/librust_c_net.so android/libs/x86_64/ && cp ../rust_c_net/include/NetBindings.hpp cpp/",
+        "copy-clib-ios": "rm -rf ios/Frameworks/RustCNet.xcframework && cp -R ../rust_c_net/target/xcframework/RustCNet.xcframework ios/Frameworks/"
+    },
+    "dependencies": {
+        "eventemitter3": "^5.0.1",
+        "react-native-nitro-buffer": "^0.0.11",
+        "readable-stream": "^4.7.0"
+    },
+    "devDependencies": {
+        "@types/node": "*",
+        "@types/readable-stream": "^4.0.23",
+        "nitrogen": "^0.32.0",
+        "react-native-nitro-modules": "^0.32.0",
+        "typescript": "^5.3.3"
+    },
+    "peerDependencies": {
+        "react-native": "*",
+        "react-native-nitro-modules": "^0.32.0"
+    },
+    "packageManager": "yarn@4.12.0",
+    "files": [
+        "lib/",
+        "src/",
+        "cpp/",
+        "ios/",
+        "android/",
+        "nitrogen/",
+        "*.podspec"
+    ]
+}

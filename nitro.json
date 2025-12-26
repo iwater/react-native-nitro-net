@@ -1,0 +1,31 @@
+{
+    "$schema": "https://nitro.margelo.com/nitro.schema.json",
+    "cxxNamespace": [
+        "net"
+    ],
+    "ios": {
+        "iosModuleName": "RustCNet"
+    },
+    "android": {
+        "androidNamespace": [
+            "net"
+        ],
+        "androidCxxLibName": "RustCNet"
+    },
+    "autolinking": {
+        "NetDriver": {
+            "cpp": "HybridNetDriver"
+        }
+    },
+    "cxx": {
+        "extraIncludeDirs": [
+            "./cpp"
+        ],
+        "extraLibs": [
+            "rust_c_net"
+        ],
+        "extraLibDirs": [
+            "./lib"
+        ]
+    }
+}
