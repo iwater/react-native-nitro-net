@@ -5,9 +5,11 @@ Node.js `net` API implementation for React Native using [Nitro Modules](https://
 ## Features
 
 *   🚀 **High Performance**: Built on top of Rust's `tokio` asynchronous runtime.
-*   🤝 **Node.js Compatible**: Implements the standard `net` API including `Socket` (Duplex stream) and `Server`.
+*   🤝 **Node.js Compatible**: Implements standard `net` and `tls` APIs including `Socket`, `Server`, `TLSSocket`, and `SecureContext`.
+*   🛡️ **Modern Security**: TLS implementation powered by **Rustls 0.23** (Ring provider), supporting TLS 1.2 and 1.3.
+*   🔒 **Full TLS Support**: Support for PEM/PFX certificates, encrypted private keys, SNI, Session tickets, and 100% Node.js API surface compatibility.
 *   ⚡ **Nitro Modules**: Uses JSI for zero-overhead communication between JavaScript and Native code.
-*   🛡️ **Robust & Stable**: Advanced fixes for common networking issues like port reuse, deadlocks, and DNS reliability.
+*   🛡️ **Robust & Stable**: Advanced fixes for port reuse, deadlocks, and DNS reliability.
 *   📱 **Cross-Platform**: Supports both iOS and Android.
 
 ## Installation
@@ -30,7 +32,7 @@ cd ios && pod install
 
 This library uses a high-performance three-layer architecture:
 
-1.  **JavaScript Layer**: Provides the high-level Node.js compatible `net.Socket` (Duplex) and `net.Server` APIs using `readable-stream` and `EventEmitter`.
+1.  **JavaScript Layer**: Provides high-level Node.js compatible `net` and `tls` APIs using `readable-stream` and `EventEmitter`.
 2.  **C++ Bridge (Nitro)**: Handles the zero-copy orchestration between JS and Rust using Nitro Hybrid Objects and JSI.
 3.  **Rust Core**: Implements the actual networking logic using the **Tokio** asynchronous runtime, providing memory safety and high concurrency.
 
@@ -73,6 +75,31 @@ server.listen(0, '127.0.0.1', () => {
 });
 ```
 
+### TLS (Secure Socket)
+
+```typescript
+import { tls } from 'react-native-nitro-net';
+
+// Client connection
+const socket = tls.connect({
+  host: 'example.com',
+  port: 443,
+  servername: 'example.com', // SNI
+}, () => {
+  console.log('Securely connected!');
+  console.log('Protocol:', socket.getProtocol());
+});
+
+// Server with PFX
+const server = tls.createServer({
+  pfx: fs.readFileSync('server.pfx'),
+  passphrase: 'your-password'
+}, (socket) => {
+  socket.write('Secure hello!');
+});
+server.listen(443);
+```
+
 ## Stability Improvements
 
 We have implemented several critical fixes to ensure production-grade stability:
@@ -81,6 +108,11 @@ We have implemented several critical fixes to ensure production-grade stability:
 *   **Anti-Deadlock Logic**: C++ layer uses lock-free callback dispatching to prevent UI freezes during high-frequency events.
 *   **DNS Reliability**: Automatically retries all resolved IP addresses if the first one fails to connect.
 *   **Resource Management**: Strict protective shutdown logic in Rust to prevent socket and Unix domain socket file leaks.
+
+## Compatibility Notes
+
+> [!IMPORTANT]
+> **`Server.close()` Behavior**: Unlike Node.js's default behavior where `server.close()` only stops accepting new connections, this implementation **immediately destroys all active connections** when `close()` is called. This ensures clean resource release and is more intuitive for mobile applications.
 
 ## API Reference
 
@@ -97,6 +129,20 @@ We have implemented several critical fixes to ensure production-grade stability:
 
 **Events**: `connect`, `ready`, `data`, `error`, `close`, `timeout`, `lookup`.
 
+### `tls.TLSSocket`
+*Extends `net.Socket`*
+
+| Property / Method | Description |
+| --- | --- |
+| `authorized` | `true` if peer certificate is verified. |
+| `getProtocol()` | Returns negotiated TLS version (e.g., "TLSv1.3"). |
+| `getCipher()` | Returns current cipher information. |
+| `getPeerCertificate()`| Returns detailed JSON of the peer certificate. |
+| `getSession()` | Returns the session ticket for resumption. |
+| `encrypted` | Always `true`. |
+
+**Events**: `secureConnect`, `session`, `keylog`, `OCSPResponse`.
+
 ### Global APIs
 
 | Method | Description |
@@ -110,11 +156,17 @@ We have implemented several critical fixes to ensure production-grade stability:
 | Method | Description |
 | --- | --- |
 | `listen(options)` | Start listening. Supports `port: 0` for dynamic allocation. |
-| `close()` | Stops the server from accepting new connections. |
+| `close()` | Stops the server and **destroys all active connections**. |
 | `address()` | Returns the bound address (crucial for dynamic ports). |
 | `getConnections(cb)`| Get count of active connections. |
 
 **Events**: `listening`, `connection`, `error`, `close`.
+
+### `tls.Server`
+*Extends `net.Server`*
+
+Supported methods: `listen`, `close`, `addContext`, `setTicketKeys`, `getTicketKeys`.
+**Events**: `secureConnection`, `keylog`, `newSession`.
 
 ## Debugging
 

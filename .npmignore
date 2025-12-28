@@ -6,4 +6,3 @@ ios/DerivedData
 *.tgz
 node_modules
 .DS_Store
-.gradle

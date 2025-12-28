@@ -49,6 +49,15 @@ public:
                ipv6Only.value_or(false), reusePort.value_or(false));
   }
 
+  void listenTLS(double port, double secureContextId,
+                 std::optional<double> backlog, std::optional<bool> ipv6Only,
+                 std::optional<bool> reusePort) override {
+    net_listen_tls(_id, static_cast<int>(port),
+                   static_cast<int>(backlog.value_or(128)),
+                   ipv6Only.value_or(false), reusePort.value_or(false),
+                   static_cast<uint32_t>(secureContextId));
+  }
+
   void listenUnix(const std::string &path,
                   std::optional<double> backlog) override {
     net_listen_unix(_id, path.c_str(), static_cast<int>(backlog.value_or(128)));

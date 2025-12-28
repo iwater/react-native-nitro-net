@@ -165,10 +165,10 @@ export interface SocketOptions extends DuplexOptions {
 }
 
 export class Socket extends Duplex {
-    private _driver: NetSocketDriver | undefined;
+    protected _driver: NetSocketDriver | undefined;
     public connecting: boolean = false; // Changed from private _connecting
-    private _connected: boolean = false;
-    private _hadError: boolean = false; // Added
+    protected _connected: boolean = false;
+    protected _hadError: boolean = false; // Added
     public remoteAddress?: string;
     public remotePort?: number;
     public remoteFamily?: string;
@@ -245,13 +245,14 @@ export class Socket extends Duplex {
         if (!this._driver) return;
         const id = (this._driver as any).id ?? (this._driver as any)._id;
         this._driver.onEvent = (eventType: number, data: ArrayBuffer) => {
+            this.emit('event', eventType, data);
             if (eventType === 3) { // ERROR
                 const msg = new TextDecoder().decode(data);
                 debugLog(`Socket (id: ${id}) NATIVE ERROR: ${msg}`);
             }
-            if (eventType === 9) { // DEBUG
-                const msg = new TextDecoder().decode(data);
-                debugLog(`Socket (id: ${id}) NATIVE DEBUG: ${msg}`);
+            if (eventType === 9) { // SESSION/DEBUG
+                debugLog(`Socket (id: ${id}) NATIVE SESSION EVENT RECEIVED`);
+                this.emit('session', data);
                 return;
             }
             debugLog(`Socket (id: ${id}, localPort: ${this.localPort}) Event TYPE: ${eventType}, data len: ${data?.byteLength}`);
@@ -705,8 +706,8 @@ export class Server extends EventEmitter {
                     this.emit('error', new Error(data ? Buffer.from(data).toString() : 'Unknown server error'));
                     break;
                 case NetServerEvent.DEBUG: {
-                    const msg = data ? Buffer.from(data).toString() : 'Unknown debug message';
-                    debugLog(`Server NATIVE DEBUG: ${msg}`);
+                    debugLog(`Server NATIVE SESSION/DEBUG EVENT RECEIVED`);
+                    this.emit('session', data);
                     break;
                 }
                 case NetServerEvent.CLOSE:
@@ -726,7 +727,6 @@ export class Server extends EventEmitter {
             this.close(() => resolve());
         });
     }
-
     listen(port?: any, host?: any, backlog?: any, callback?: any): this {
         let _port = 0;
         let _host: string | undefined;
@@ -797,6 +797,13 @@ export class Server extends EventEmitter {
     }
 
     close(callback?: (err?: Error) => void): this {
+        // Destroy all active connections first
+        for (const socket of this._sockets) {
+            socket.destroy();
+        }
+        this._sockets.clear();
+        this._connections = 0;
+
         this._driver.close();
         if (callback) this.once('close', callback);
         return this;
@@ -839,6 +846,8 @@ export const connect = createConnection;
 export function createServer(options?: any, connectionListener?: (socket: Socket) => void): Server {
     return new Server(options, connectionListener);
 }
+
+export * as tls from './tls'
 
 export {
     isIP,

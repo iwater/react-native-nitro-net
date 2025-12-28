@@ -4,11 +4,14 @@
 #include "NetBindings.hpp"
 #include "NetManager.hpp"
 #include <NitroModules/ArrayBuffer.hpp>
+#include <optional>
 #include <string>
 
 namespace margelo {
 namespace nitro {
 namespace net {
+
+using namespace margelo::nitro;
 
 class HybridNetSocketDriver : public HybridNetSocketDriverSpec {
 public:
@@ -48,6 +51,111 @@ public:
     net_connect(_id, host.c_str(), static_cast<int>(port));
   }
 
+  void connectTLS(const std::string &host, double port,
+                  const std::optional<std::string> &serverName,
+                  std::optional<bool> rejectUnauthorized) override {
+    const char *sni = serverName.has_value() ? serverName->c_str() : nullptr;
+    bool ru = rejectUnauthorized.value_or(true);
+    net_connect_tls(_id, host.c_str(), static_cast<int>(port), sni,
+                    static_cast<int>(ru));
+  }
+
+  void connectTLSWithContext(const std::string &host, double port,
+                             const std::optional<std::string> &serverName,
+                             std::optional<bool> rejectUnauthorized,
+                             std::optional<double> secureContextId) override {
+    const char *sni = serverName.has_value() ? serverName->c_str() : nullptr;
+    bool ru = rejectUnauthorized.value_or(true);
+    if (secureContextId.has_value()) {
+      net_connect_tls_with_context(
+          _id, host.c_str(), static_cast<int>(port), sni, static_cast<int>(ru),
+          static_cast<uint32_t>(secureContextId.value()));
+    } else {
+      net_connect_tls(_id, host.c_str(), static_cast<int>(port), sni,
+                      static_cast<int>(ru));
+    }
+  }
+
+  std::optional<std::string> getAuthorizationError() override {
+    char buf[1024];
+    size_t len = net_get_authorization_error(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> getProtocol() override {
+    char buf[128];
+    size_t len = net_get_protocol(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> getCipher() override {
+    char buf[256];
+    size_t len = net_get_cipher(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> getALPN() override {
+    char buf[64];
+    size_t len = net_get_alpn(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> getPeerCertificateJSON() override {
+    char buf[16384];
+    size_t len = net_get_peer_certificate_json(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf, len);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> getEphemeralKeyInfo() override {
+    char buf[512];
+    size_t len = net_get_ephemeral_key_info(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf, len);
+    }
+    return std::nullopt;
+  }
+
+  std::optional<std::string> getSharedSigalgs() override {
+    char buf[1024];
+    size_t len = net_get_shared_sigalgs(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf, len);
+    }
+    return std::nullopt;
+  }
+
+  bool isSessionReused() override { return net_is_session_reused(_id); }
+
+  std::optional<std::shared_ptr<ArrayBuffer>> getSession() override {
+    uint8_t buf[2048];
+    size_t len = net_get_session(_id, buf, sizeof(buf));
+    if (len > 0) {
+      return ArrayBuffer::copy(buf, len);
+    }
+    return std::nullopt;
+  }
+
+  void setSession(const std::shared_ptr<ArrayBuffer> &session) override {
+    if (session && session->size() > 0) {
+      net_set_session(_id, session->data(), session->size());
+    }
+  }
+
   void write(const std::shared_ptr<ArrayBuffer> &data) override {
     if (!data)
       return;
@@ -69,6 +177,8 @@ public:
       _id = 0;
     }
   }
+
+  void enableKeylog() override { net_socket_enable_keylog(_id); }
 
   void setNoDelay(bool enable) override { net_set_nodelay(_id, enable); }
 
@@ -105,6 +215,45 @@ public:
 
   void connectUnix(const std::string &path) override {
     net_connect_unix(_id, path.c_str());
+  }
+
+  void connectUnixTLS(const std::string &path,
+                      const std::optional<std::string> &serverName,
+                      std::optional<bool> rejectUnauthorized) override {
+#if !defined(__ANDROID__)
+    const char *sni = serverName.has_value() ? serverName->c_str() : "";
+    bool ru = rejectUnauthorized.value_or(true);
+    net_connect_unix_tls(_id, path.c_str(), sni, static_cast<int>(ru));
+#else
+    // Unix TLS not supported on Android
+    (void)path;
+    (void)serverName;
+    (void)rejectUnauthorized;
+#endif
+  }
+
+  void
+  connectUnixTLSWithContext(const std::string &path,
+                            const std::optional<std::string> &serverName,
+                            std::optional<bool> rejectUnauthorized,
+                            std::optional<double> secureContextId) override {
+#if !defined(__ANDROID__)
+    const char *sni = serverName.has_value() ? serverName->c_str() : "";
+    bool ru = rejectUnauthorized.value_or(true);
+    if (secureContextId.has_value()) {
+      net_connect_unix_tls_with_context(
+          _id, path.c_str(), sni, static_cast<int>(ru),
+          static_cast<uint32_t>(secureContextId.value()));
+    } else {
+      net_connect_unix_tls(_id, path.c_str(), sni, static_cast<int>(ru));
+    }
+#else
+    // Unix TLS not supported on Android
+    (void)path;
+    (void)serverName;
+    (void)rejectUnauthorized;
+    (void)secureContextId;
+#endif
   }
 
 private:

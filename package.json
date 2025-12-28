@@ -1,10 +1,11 @@
 {
     "name": "react-native-nitro-net",
-    "version": "0.1.5",
     "description": "Ultra-high-performance networking to React Native by combining a memory-safe Rust core with the zero-overhead Nitro Modules JSI bridge. Provides Node.js-compatible net API.",
+    "version": "0.2.0",
     "main": "./lib/index.js",
     "module": "./lib/index.js",
     "types": "./lib/index.d.ts",
+    "react-native": "src/index.ts",
     "keywords": [
         "react-native",
         "ios",
@@ -24,6 +25,7 @@
         "url": "https://github.com/iwater/react-native-nitro-net/issues"
     },
     "scripts": {
+        "one": "yarn copy-clib && yarn build && yarn pack",
         "build": "npx nitrogen@0.32.0 && tsc",
         "prepare": "npm run build",
         "copy-clib": "rm -rf ios/Frameworks/RustCNet.xcframework && cp -R ../rust_c_net/target/xcframework/RustCNet.xcframework ios/Frameworks/ && mkdir -p android/libs/arm64-v8a android/libs/armeabi-v7a android/libs/x86 android/libs/x86_64 && cp ../rust_c_net/target/aarch64-linux-android/release/librust_c_net.so android/libs/arm64-v8a/ && cp ../rust_c_net/target/armv7-linux-androideabi/release/librust_c_net.so android/libs/armeabi-v7a/ && cp ../rust_c_net/target/i686-linux-android/release/librust_c_net.so android/libs/x86/ && cp ../rust_c_net/target/x86_64-linux-android/release/librust_c_net.so android/libs/x86_64/ && cp ../rust_c_net/include/NetBindings.hpp cpp/",
@@ -32,7 +34,7 @@
     },
     "dependencies": {
         "eventemitter3": "^5.0.1",
-        "react-native-nitro-buffer": "^0.0.11",
+        "react-native-nitro-buffer": "^0.0.13",
         "readable-stream": "^4.7.0"
     },
     "devDependencies": {

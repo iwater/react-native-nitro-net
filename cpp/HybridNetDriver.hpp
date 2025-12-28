@@ -4,10 +4,15 @@
 #include "HybridNetServerDriver.hpp"
 #include "HybridNetSocketDriver.hpp"
 #include "NetManager.hpp"
+#include <NitroModules/ArrayBuffer.hpp>
+#include <optional>
+#include <string>
 
 namespace margelo {
 namespace nitro {
 namespace net {
+
+using namespace margelo::nitro;
 
 class HybridNetDriver : public HybridNetDriverSpec {
 public:
@@ -29,6 +34,69 @@ public:
 
   std::shared_ptr<HybridNetServerDriverSpec> createServer() override {
     return std::make_shared<HybridNetServerDriver>();
+  }
+
+  double
+  createSecureContext(const std::string &cert, const std::string &key,
+                      const std::optional<std::string> &passphrase) override {
+    return static_cast<double>(net_create_secure_context(
+        cert.c_str(), key.c_str(),
+        passphrase.has_value() ? passphrase.value().c_str() : nullptr));
+  }
+
+  double createEmptySecureContext() override {
+    return static_cast<double>(net_secure_context_create());
+  }
+
+  void addCACertToSecureContext(double scId, const std::string &ca) override {
+    net_secure_context_add_ca(static_cast<uint32_t>(scId), ca.c_str());
+  }
+
+  void addContextToSecureContext(
+      double scId, const std::string &hostname, const std::string &cert,
+      const std::string &key,
+      const std::optional<std::string> &passphrase) override {
+    net_secure_context_add_context(
+        static_cast<uint32_t>(scId), hostname.c_str(), cert.c_str(),
+        key.c_str(),
+        passphrase.has_value() ? passphrase.value().c_str() : nullptr);
+  }
+
+  void
+  setPFXToSecureContext(double scId, const std::shared_ptr<ArrayBuffer> &pfx,
+                        const std::optional<std::string> &passphrase) override {
+    if (pfx) {
+      net_secure_context_set_pfx(
+          static_cast<uint32_t>(scId), pfx->data(), pfx->size(),
+          passphrase.has_value() ? passphrase.value().c_str() : nullptr);
+    }
+  }
+
+  void setOCSPResponseToSecureContext(
+      double scId, const std::shared_ptr<ArrayBuffer> &ocsp) override {
+    if (ocsp) {
+      net_secure_context_set_ocsp_response(static_cast<uint32_t>(scId),
+                                           ocsp->data(), ocsp->size());
+    }
+  }
+
+  std::optional<std::shared_ptr<ArrayBuffer>>
+  getTicketKeys(double scId) override {
+    uint8_t buf[256];
+    size_t len = net_server_get_ticket_keys(static_cast<uint32_t>(scId), buf,
+                                            sizeof(buf));
+    if (len > 0) {
+      return ArrayBuffer::copy(buf, len);
+    }
+    return std::nullopt;
+  }
+
+  void setTicketKeys(double scId,
+                     const std::shared_ptr<ArrayBuffer> &keys) override {
+    if (keys) {
+      net_server_set_ticket_keys(static_cast<uint32_t>(scId), keys->data(),
+                                 keys->size());
+    }
   }
 
   void initWithConfig(const NetConfig &config) override {

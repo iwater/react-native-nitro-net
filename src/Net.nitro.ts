@@ -19,13 +19,29 @@ export enum NetSocketEvent {
     DRAIN = 5,
     TIMEOUT = 7,
     LOOKUP = 8,
-    DEBUG = 9
+    SESSION = 9,
+    KEYLOG = 10,
+    OCSP = 11
 }
 
 export interface NetSocketDriver extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
     readonly id: number
     connect(host: string, port: number): void
+    connectTLS(host: string, port: number, serverName?: string, rejectUnauthorized?: boolean): void
+    connectTLSWithContext(host: string, port: number, serverName?: string, rejectUnauthorized?: boolean, secureContextId?: number): void
+    getAuthorizationError(): string | undefined
+    getProtocol(): string | undefined
+    getCipher(): string | undefined
+    getALPN(): string | undefined
+    getPeerCertificateJSON(): string | undefined
+    getEphemeralKeyInfo(): string | undefined
+    getSharedSigalgs(): string | undefined
+    isSessionReused(): boolean
+    getSession(): ArrayBuffer | undefined
+    setSession(session: ArrayBuffer): void
     connectUnix(path: string): void
+    connectUnixTLS(path: string, serverName?: string, rejectUnauthorized?: boolean): void
+    connectUnixTLSWithContext(path: string, serverName?: string, rejectUnauthorized?: boolean, secureContextId?: number): void
     write(data: ArrayBuffer): void
     pause(): void
     resume(): void
@@ -33,6 +49,7 @@ export interface NetSocketDriver extends HybridObject<{ ios: 'swift', android: '
     setTimeout(timeout: number): void
     destroy(): void
     resetAndDestroy(): void
+    enableKeylog(): void
     setNoDelay(enable: boolean): void
     setKeepAlive(enable: boolean, delay: number): void
     getLocalAddress(): string
@@ -50,6 +67,7 @@ export enum NetServerEvent {
 export interface NetServerDriver extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
     onEvent: (event: number, data: ArrayBuffer) => void
     listen(port: number, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
+    listenTLS(port: number, secureContextId: number, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
     listenUnix(path: string, backlog?: number): void
     /**
      * Listen on an existing file descriptor (handle)
@@ -76,6 +94,14 @@ export interface NetConfig {
 export interface NetDriver extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
     createSocket(id?: string): NetSocketDriver
     createServer(): NetServerDriver
+    createSecureContext(cert: string, key: string, passphrase?: string): number
+    createEmptySecureContext(): number
+    addCACertToSecureContext(scId: number, ca: string): void
+    addContextToSecureContext(scId: number, hostname: string, cert: string, key: string, passphrase?: string): void
+    setPFXToSecureContext(scId: number, pfx: ArrayBuffer, passphrase?: string): void
+    setOCSPResponseToSecureContext(scId: number, ocsp: ArrayBuffer): void
+    getTicketKeys(scId: number): ArrayBuffer | undefined
+    setTicketKeys(scId: number, keys: ArrayBuffer): void
     /**
      * Initialize the network module with custom configuration
      * Must be called before any other network operations
