@@ -42,6 +42,13 @@ void net_socket_reset_and_destroy(uint32_t id);
 size_t net_get_ephemeral_key_info(uint32_t id, char *buf, size_t len);
 size_t net_get_shared_sigalgs(uint32_t id, char *buf, size_t len);
 
+// TLS Features: enableTrace and exportKeyingMaterial
+void net_socket_enable_trace(uint32_t id);
+int net_socket_export_keying_material(uint32_t id, size_t length,
+                                      const char *label, const uint8_t *context,
+                                      size_t context_len, uint8_t *buf,
+                                      size_t buf_len);
+
 // New Options
 void net_set_nodelay(uint32_t id, bool enable);
 void net_set_keepalive(uint32_t id, bool enable, uint64_t delay_ms);
@@ -60,6 +67,8 @@ void net_shutdown(uint32_t id);
 // IPC / Unix Domain Sockets
 void net_connect_unix(uint32_t id, const char *path);
 void net_listen_unix(uint32_t id, const char *path, int backlog);
+void net_listen_tls_unix(uint32_t id, const char *path, int backlog,
+                         uint32_t secure_context_id);
 
 #if !defined(__ANDROID__)
 // Unix-only TLS functions (not available on Android)
@@ -107,6 +116,12 @@ size_t net_get_session(uint32_t id, uint8_t *buf, size_t len);
 void net_set_session(uint32_t id, const uint8_t *ticket, size_t ticket_len);
 size_t net_server_get_ticket_keys(uint32_t id, uint8_t *buf, size_t len);
 void net_server_set_ticket_keys(uint32_t id, const uint8_t *keys, size_t len);
+
+// HTTP Parser
+uint32_t net_http_parser_create(int mode);
+int net_http_parser_feed(uint32_t id, const uint8_t *data, size_t len,
+                         char *buf, size_t buf_len);
+void net_http_parser_destroy(uint32_t id);
 
 // Event Types
 #define NET_EVENT_CONNECT 1

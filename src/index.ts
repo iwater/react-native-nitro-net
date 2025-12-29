@@ -33,14 +33,19 @@ let _autoSelectFamilyDefault = 4; // Node default is usually 4/6 independent, bu
 let _isVerbose = false;
 let _isInitialized = false;
 
-function debugLog(message: string) {
-    if (_isVerbose) {
-        console.log(`[NET DEBUG] ${message}`);
-    }
+function isVerbose(): boolean {
+    return _isVerbose;
 }
 
 function setVerbose(enabled: boolean): void {
     _isVerbose = enabled;
+}
+
+function debugLog(message: string) {
+    if (_isVerbose) {
+        const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
+        console.log(`[NET DEBUG ${timestamp}] ${message}`);
+    }
 }
 
 function getDefaultAutoSelectFamily(): number {
@@ -79,6 +84,9 @@ function ensureInitialized(): void {
  */
 function initWithConfig(config: NetConfig): void {
     _isInitialized = true;
+    if (config.debug !== undefined) {
+        setVerbose(config.debug);
+    }
     Driver.initWithConfig(config);
 }
 
@@ -89,17 +97,69 @@ function initWithConfig(config: NetConfig): void {
 // SocketAddress
 // -----------------------------------------------------------------------------
 
+export interface SocketAddressOptions {
+    address?: string;
+    family?: 'ipv4' | 'ipv6';
+    port?: number;
+    flowlabel?: number;
+}
+
 export class SocketAddress {
     readonly address: string;
     readonly family: 'ipv4' | 'ipv6';
     readonly port: number;
     readonly flowlabel: number;
 
-    constructor(options: { address: string, family?: 'ipv4' | 'ipv6', port: number, flowlabel?: number }) {
-        this.address = options.address;
-        this.family = options.family || (isIPv6(options.address) ? 'ipv6' : 'ipv4');
-        this.port = options.port;
-        this.flowlabel = options.flowlabel || 0;
+    constructor(options: SocketAddressOptions = {}) {
+        this.address = options.address ?? (options.family === 'ipv6' ? '::' : '127.0.0.1');
+        this.family = options.family || (isIPv6(this.address) ? 'ipv6' : 'ipv4');
+        this.port = options.port ?? 0;
+        this.flowlabel = options.flowlabel ?? 0;
+    }
+
+    /**
+     * Attempts to parse a string containing a socket address.
+     * Returns a SocketAddress if successful, or undefined if not.
+     * 
+     * Supported formats:
+     * - `ip:port` (e.g., `127.0.0.1:8080`, `[::1]:8080`)
+     * - `ip` only (port defaults to 0)
+     */
+    static parse(input: string): SocketAddress | undefined {
+        if (!input || typeof input !== 'string') return undefined;
+        let address: string;
+        let port = 0;
+
+        // Handle IPv6 bracket notation: [::1]:port
+        const ipv6Match = input.match(/^\[([^\]]+)\]:?(\d*)$/);
+        if (ipv6Match) {
+            address = ipv6Match[1];
+            port = ipv6Match[2] ? parseInt(ipv6Match[2], 10) : 0;
+            if (!isIPv6(address)) return undefined;
+            return new SocketAddress({ address, port, family: 'ipv6' });
+        }
+
+        // Handle IPv4 or IPv6 without brackets
+        const lastColon = input.lastIndexOf(':');
+        if (lastColon === -1) {
+            // No port, just IP
+            address = input;
+        } else {
+            // Determine if the colon is a port separator or part of IPv6
+            const potentialPort = input.slice(lastColon + 1);
+            const potentialAddr = input.slice(0, lastColon);
+            if (/^\d+$/.test(potentialPort) && (isIPv4(potentialAddr) || isIPv6(potentialAddr))) {
+                address = potentialAddr;
+                port = parseInt(potentialPort, 10);
+            } else {
+                // It's an IPv6 address without port
+                address = input;
+            }
+        }
+
+        const family = isIPv6(address) ? 'ipv6' : (isIPv4(address) ? 'ipv4' : undefined);
+        if (!family) return undefined;
+        return new SocketAddress({ address, port, family });
     }
 }
 
@@ -107,8 +167,30 @@ export class SocketAddress {
 // BlockList
 // -----------------------------------------------------------------------------
 
+export interface BlockListRule {
+    type: 'address' | 'range' | 'subnet';
+    address?: string;
+    start?: string;
+    end?: string;
+    prefix?: number;
+    family: 'ipv4' | 'ipv6';
+}
+
 export class BlockList {
     private _rules: Array<{ type: 'address' | 'range' | 'subnet', data: any }> = [];
+
+    /** Returns an array of rules added to the blocklist. */
+    get rules(): BlockListRule[] {
+        return this._rules.map(r => {
+            if (r.type === 'address') {
+                return { type: 'address' as const, address: r.data.address, family: r.data.family };
+            } else if (r.type === 'range') {
+                return { type: 'range' as const, start: r.data.start, end: r.data.end, family: r.data.family };
+            } else {
+                return { type: 'subnet' as const, address: r.data.net, prefix: r.data.prefix, family: r.data.family };
+            }
+        });
+    }
 
     addAddress(address: string, family?: 'ipv4' | 'ipv6'): void {
         this._rules.push({ type: 'address', data: { address, family: family || (isIPv6(address) ? 'ipv6' : 'ipv4') } });
@@ -142,6 +224,37 @@ export class BlockList {
             }
         }
         return false;
+    }
+
+    /**
+     * Serializes the BlockList to a JSON-compatible format.
+     */
+    toJSON(): BlockListRule[] {
+        return this.rules;
+    }
+
+    /**
+     * Creates a BlockList from a JSON array of rules.
+     */
+    static fromJSON(json: BlockListRule[]): BlockList {
+        const list = new BlockList();
+        for (const rule of json) {
+            if (rule.type === 'address' && rule.address) {
+                list.addAddress(rule.address, rule.family);
+            } else if (rule.type === 'range' && rule.start && rule.end) {
+                list.addRange(rule.start, rule.end, rule.family);
+            } else if (rule.type === 'subnet' && rule.address && rule.prefix !== undefined) {
+                list.addSubnet(rule.address, rule.prefix, rule.family);
+            }
+        }
+        return list;
+    }
+
+    /**
+     * Checks if a given value is a BlockList instance.
+     */
+    static isBlockList(value: unknown): value is BlockList {
+        return value instanceof BlockList;
     }
 }
 
@@ -178,6 +291,7 @@ export class Socket extends Duplex {
     public bytesWritten: number = 0;
     public autoSelectFamilyAttemptedAddresses: string[] = [];
     private _autoSelectFamily: boolean = false;
+    private _timeout: number = 0;
 
     get localFamily(): string {
         return this.localAddress && this.localAddress.includes(':') ? 'IPv6' : 'IPv4';
@@ -203,7 +317,9 @@ export class Socket extends Duplex {
         super({
             allowHalfOpen: options?.allowHalfOpen ?? false,
             readable: options?.readable ?? true,
-            writable: options?.writable ?? true
+            writable: options?.writable ?? true,
+            // @ts-ignore
+            autoDestroy: false
         });
 
         if (options?.socketDriver) {
@@ -211,6 +327,8 @@ export class Socket extends Duplex {
             this._driver = options.socketDriver;
             this._connected = true;
             this._setupEvents();
+            // Enable noDelay by default
+            this._driver.setNoDelay(true);
             // Resume the socket since it starts paused on server-accept
             this.resume();
             // Emit connect for server-side socket? No, it's already connected.
@@ -219,8 +337,10 @@ export class Socket extends Duplex {
             ensureInitialized();
             this._driver = Driver.createSocket();
             this._setupEvents();
-            // Also resume client socket initially so it's ready to receive
-            this.resume();
+            // Enable noDelay by default to match Node.js and reduce latency for small writes
+            this._driver.setNoDelay(true);
+            // Do NOT resume here - socket is not connected yet!
+            // resume() will be called after 'connect' event in _connect()
         }
 
         this.on('finish', () => {
@@ -261,6 +381,8 @@ export class Socket extends Duplex {
                     this.connecting = false;
                     this._connected = true;
                     this._updateAddresses();
+                    // Now that we're connected, start receiving data
+                    this.resume();
                     this.emit('connect');
                     this.emit('ready');
                     break;
@@ -409,6 +531,7 @@ export class Socket extends Duplex {
             this._autoSelectFamily = true;
         }
 
+        debugLog(`Socket.connect: target=${host}:${port}, autoSelectFamily=${this._autoSelectFamily}`);
         return this._connect(port, host, connectionListener, options.signal);
     }
 
@@ -431,6 +554,7 @@ export class Socket extends Duplex {
             this.once('close', () => signal.removeEventListener('abort', abortHandler));
         }
 
+        debugLog(`Socket._connect: Calling driver.connect(${host}, ${port})`);
         this._driver?.connect(host, port);
         return this;
     }
@@ -511,6 +635,7 @@ export class Socket extends Duplex {
 
     // Standard net.Socket methods
     setTimeout(msecs: number, callback?: () => void): this {
+        this._timeout = msecs;
         if (this._driver) {
             this._driver.setTimeout(msecs);
         }
@@ -534,12 +659,13 @@ export class Socket extends Duplex {
      * Resume reading after a call to pause().
      */
     resume(): this {
-        const id = (this._driver as any)?.id;
-        debugLog(`Socket.resume() called, id: ${id}`);
+        const driver = this._driver as any;
+        const id = driver?.id;
+        debugLog(`Socket.resume() called, id: ${id === undefined ? 'none' : id}, destroyed: ${this.destroyed}`);
         super.resume();
-        if (this._driver) {
+        if (driver) {
             debugLog(`Socket.resume() calling driver.resume(), id: ${id}`);
-            this._driver.resume();
+            driver.resume();
         }
         return this;
     }
@@ -569,8 +695,8 @@ export class Socket extends Duplex {
         return this;
     }
 
-    get timeout(): number | undefined {
-        return undefined; // Not tracked strictly as a property yet
+    get timeout(): number {
+        return this._timeout;
     }
 
     get bufferSize(): number {
@@ -848,6 +974,8 @@ export function createServer(options?: any, connectionListener?: (socket: Socket
 }
 
 export * as tls from './tls'
+export * as http from './http'
+export * as https from './https'
 
 export {
     isIP,
@@ -855,6 +983,7 @@ export {
     isIPv6,
     getDefaultAutoSelectFamily,
     setDefaultAutoSelectFamily,
+    isVerbose,
     setVerbose,
     initWithConfig,
 };
@@ -876,4 +1005,6 @@ export default {
     setDefaultAutoSelectFamily,
     setVerbose,
     initWithConfig,
+    http: require('./http'),
+    https: require('./https'),
 };

@@ -4,8 +4,10 @@
 #include "NetBindings.hpp"
 #include "NetManager.hpp"
 #include <NitroModules/ArrayBuffer.hpp>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace margelo {
 namespace nitro {
@@ -179,6 +181,31 @@ public:
   }
 
   void enableKeylog() override { net_socket_enable_keylog(_id); }
+
+  void enableTrace() override { net_socket_enable_trace(_id); }
+
+  std::optional<std::shared_ptr<ArrayBuffer>> exportKeyingMaterial(
+      double length, const std::string &label,
+      const std::optional<std::shared_ptr<ArrayBuffer>> &context) override {
+    size_t len = static_cast<size_t>(length);
+    std::vector<uint8_t> output(len);
+
+    const uint8_t *ctx_data = nullptr;
+    size_t ctx_len = 0;
+    if (context.has_value() && context.value()) {
+      ctx_data = context.value()->data();
+      ctx_len = context.value()->size();
+    }
+
+    int result = net_socket_export_keying_material(
+        _id, len, label.c_str(), ctx_data, ctx_len, output.data(),
+        output.size());
+
+    if (result > 0) {
+      return ArrayBuffer::copy(output.data(), static_cast<size_t>(result));
+    }
+    return std::nullopt;
+  }
 
   void setNoDelay(bool enable) override { net_set_nodelay(_id, enable); }
 

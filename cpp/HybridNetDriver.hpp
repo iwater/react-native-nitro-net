@@ -1,6 +1,8 @@
 #pragma once
 
+#include "../nitrogen/generated/shared/c++/HybridHttpParserSpec.hpp"
 #include "../nitrogen/generated/shared/c++/HybridNetDriverSpec.hpp"
+#include "HybridHttpParser.hpp"
 #include "HybridNetServerDriver.hpp"
 #include "HybridNetSocketDriver.hpp"
 #include "NetManager.hpp"
@@ -34,6 +36,10 @@ public:
 
   std::shared_ptr<HybridNetServerDriverSpec> createServer() override {
     return std::make_shared<HybridNetServerDriver>();
+  }
+
+  std::shared_ptr<HybridHttpParserSpec> createHttpParser(double mode) override {
+    return std::make_shared<HybridHttpParser>(static_cast<int>(mode));
   }
 
   double

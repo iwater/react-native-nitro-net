@@ -1,15 +1,15 @@
 # react-native-nitro-net
 
-基于 [Nitro Modules](https://github.com/mrousavy/nitro) 和 Rust 实现的 React Native Node.js `net` API。
+基于 [Nitro Modules](https://github.com/mrousavy/nitro) 和 Rust 实现的 React Native Node.js `net`, `tls`, `http` 和 `https` API。
 
 ## 特性
 
 *   🚀 **高性能**: 基于 Rust 的 `tokio` 异步运行时构建。
-*   🤝 **兼容 Node.js**: 实现了标准的 `net` 和 `tls` API，包括 `Socket`, `Server`, `TLSSocket` 和 `SecureContext`。
+*   🤝 **兼容 Node.js**: 实现了标准的 `net`, `tls`, `http` 和 `https` API。
 *   🛡️ **现代安全**: TLS 实现由 **Rustls 0.23** (Ring provider) 驱动，支持 TLS 1.2 和 1.3。
-*   🔒 **全功能 TLS 支持**: 支持 PEM/PFX 证书、加密私钥、SNI、Session ticket，并实现 100% Node.js API 表面兼容。
+*   🔒 **全协议支持**: 支持 PEM/PFX 证书、SNI、HTTP Trailers、100 Continue、协议升级 (101) 以及 HTTP 隧道 (CONNECT)。
 *   ⚡ **Nitro Modules**: 使用 JSI 进行 JavaScript 和 Native 代码之间的零开销通信。
-*   🛡️ **稳健且稳定**: 针对端口复用、死锁和 DNS 可靠性等常见网络问题进行了高级修复。
+*   🛡️ **稳健且稳定**: 针对端口复用、死锁和连接池挂起等常见网络问题进行了高级修复。
 *   📱 **跨平台**: 支持 iOS 和 Android。
 
 ## 安装
@@ -100,14 +100,67 @@ const server = tls.createServer({
 server.listen(443);
 ```
 
-## 稳定性改进
-
-我们实施了多个关键修复以确保生产级的稳定性：
-
-*   **端口复用 (`SO_REUSEPORT`)**: 在 Unix/iOS 上默认启用，允许服务器立即重启，避免 "Address already in use" 错误。
-*   **防死锁逻辑**: C++ 层采用无锁回调调度，防止在高频事件期间 UI 冻结。
-*   **DNS 可靠性**: 如果第一个解析出的 IP 地址连接失败，会自动重试所有解析出的地址。
+*   **高级特性**: 支持 Wireshark 的 `keylog` 事件重发、会话恢复 (Session Resumption) 以及 `asyncDispose`。
+*   **性能调优**: 可配置 `headersTimeout`, `keepAliveTimeout`, 和 `requestTimeout`。
 *   **资源管理**: Rust 端严格的保护性关闭逻辑，防止 socket 和 Unix 域套接字文件泄漏。
+
+## 使用
+
+### HTTP 请求
+
+实现了标准的 Node.js `http` API。
+
+```typescript
+import { http } from 'react-native-nitro-net';
+
+http.get('http://google.com', (res) => {
+  console.log(`状态码: ${res.statusCode}`);
+  res.on('data', (chunk) => console.log(`收到数据分块: ${chunk.length} 字节`));
+  res.on('end', () => console.log('请求完成'));
+});
+```
+
+### HTTPS 与连接池
+
+使用 `https` 和内置的 `Agent` 进行连接复用。
+
+```typescript
+import { https } from 'react-native-nitro-net';
+
+const agent = new https.Agent({ keepAlive: true });
+
+https.get('https://api.github.com/users/margelo', { agent }, (res) => {
+  // ... 处理响应
+});
+```
+
+### TCP 客户端 (Socket)
+
+```typescript
+import net from 'react-native-nitro-net';
+
+const client = net.createConnection({ port: 8080, host: '127.0.0.1' }, () => {
+  client.write('Hello Server!');
+});
+```
+
+### 服务端 (支持动态端口分配)
+
+服务器支持通过使用端口 `0` 来绑定到动态端口。
+
+```typescript
+import net from 'react-native-nitro-net';
+
+const server = net.createServer((socket) => {
+  socket.write('Echo: ' + socket.read());
+});
+
+// 使用 0 进行动态端口分配
+server.listen(0, '127.0.0.1', () => {
+  const address = server.address();
+  console.log(`服务器监听在动态端口: ${address?.port}`);
+});
+```
 
 ## 兼容性说明
 
@@ -147,7 +200,7 @@ server.listen(443);
 
 | 方法 | 说明 |
 | --- | --- |
-| `initWithConfig(options)` | 可选。使用自定义设置（如 `workerThreads`）初始化 Rust 运行时。必须在进行任何其他操作之前调用。 |
+| `initWithConfig(options)` | 可选。使用自定义设置 (例如 `workerThreads`, `debug`) 初始化 Rust 运行时。必须在进行任何其他操作前调用。 |
 | `setVerbose(bool)` | 开启/关闭 JS、C++ 和 Rust 的详细日志。 |
 | `isIP(string)` | 返回 `0`, `4`, 或 `6`。 |
 
@@ -159,8 +212,9 @@ server.listen(443);
 | `close()` | 停止服务器并**销毁所有活跃连接**。 |
 | `address()` | 返回绑定的地址（获取动态端口的关键）。 |
 | `getConnections(cb)`| 获取当前活跃连接数。 |
+| `renegotiate(opt, cb)`| **Shim**: 返回 `ERR_TLS_RENEGOTIATION_DISABLED` (Rustls 安全策略)。 |
 
-**事件**: `listening`, `connection`, `error`, `close`。
+**事件**: `listening`, `connection`, `error`, `close`, `connect` (HTTP 隧道)。
 
 ### `tls.Server`
 *继承自 `net.Server`*

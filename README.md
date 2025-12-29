@@ -1,15 +1,15 @@
 # react-native-nitro-net
 
-Node.js `net` API implementation for React Native using [Nitro Modules](https://github.com/mrousavy/nitro) and Rust.
+Ultra-high-performance networking to React Native by combining a memory-safe Rust core with the zero-overhead Nitro Modules JSI bridge. Provides Node.js-compatible net, tls, http(s) API.
 
 ## Features
 
 *   🚀 **High Performance**: Built on top of Rust's `tokio` asynchronous runtime.
-*   🤝 **Node.js Compatible**: Implements standard `net` and `tls` APIs including `Socket`, `Server`, `TLSSocket`, and `SecureContext`.
+*   🤝 **Node.js Compatible**: Implements standard `net`, `tls`, `http`, and `https` APIs.
 *   🛡️ **Modern Security**: TLS implementation powered by **Rustls 0.23** (Ring provider), supporting TLS 1.2 and 1.3.
-*   🔒 **Full TLS Support**: Support for PEM/PFX certificates, encrypted private keys, SNI, Session tickets, and 100% Node.js API surface compatibility.
+*   🔒 **Full Protocol Support**: Support for PEM/PFX certificates, SNI, HTTP Trailers, 100 Continue, Protocol Upgrades (101), and HTTP Tunneling (CONNECT).
 *   ⚡ **Nitro Modules**: Uses JSI for zero-overhead communication between JavaScript and Native code.
-*   🛡️ **Robust & Stable**: Advanced fixes for port reuse, deadlocks, and DNS reliability.
+*   🛡️ **Robust & Stable**: Advanced fixes for port reuse, deadlocks, and connection pooling hangs.
 *   📱 **Cross-Platform**: Supports both iOS and Android.
 
 ## Installation
@@ -100,14 +100,66 @@ const server = tls.createServer({
 server.listen(443);
 ```
 
-## Stability Improvements
-
-We have implemented several critical fixes to ensure production-grade stability:
-
-*   **Port Reuse (`SO_REUSEPORT`)**: Automatically enabled on Unix/iOS to allow immediate server restarts without the "Address already in use" error.
-*   **Anti-Deadlock Logic**: C++ layer uses lock-free callback dispatching to prevent UI freezes during high-frequency events.
-*   **DNS Reliability**: Automatically retries all resolved IP addresses if the first one fails to connect.
+*   **Advanced Features**: Supports `keylog` event re-emission for Wireshark, session resumption, and `asyncDispose`.
+*   **Performance Tuning**: Configurable `headersTimeout`, `keepAliveTimeout`, and `requestTimeout`.
 *   **Resource Management**: Strict protective shutdown logic in Rust to prevent socket and Unix domain socket file leaks.
+
+## Usage
+
+### HTTP Request
+
+Implementation of the standard Node.js `http` API.
+
+```typescript
+import { http } from 'react-native-nitro-net';
+
+http.get('http://google.com', (res) => {
+  console.log(`Status: ${res.statusCode}`);
+  res.on('data', (chunk) => console.log(`Body segment: ${chunk.length} bytes`));
+  res.on('end', () => console.log('Request complete'));
+});
+```
+
+### HTTPS with Connection Pooling
+
+Uses `https` and the built-in `Agent` for connection reuse.
+
+```typescript
+import { https } from 'react-native-nitro-net';
+
+const agent = new https.Agent({ keepAlive: true });
+
+https.get('https://api.github.com/users/margelo', { agent }, (res) => {
+  // ... handle response
+});
+```
+
+### TCP Client (Socket)
+
+```typescript
+import net from 'react-native-nitro-net';
+
+const client = net.createConnection({ port: 8080, host: '127.0.0.1' }, () => {
+  client.write('Hello Server!');
+});
+```
+
+### Server (Dynamic Port Support)
+
+The server supports binding to a dynamic port by using `0`.
+
+```typescript
+import net from 'react-native-nitro-net';
+
+const server = net.createServer((socket) => {
+  socket.write('Echo: ' + socket.read());
+});
+
+server.listen(0, '127.0.0.1', () => {
+  const address = server.address();
+  console.log(`Server listening on dynamic port: ${address?.port}`);
+});
+```
 
 ## Compatibility Notes
 
@@ -147,7 +199,7 @@ We have implemented several critical fixes to ensure production-grade stability:
 
 | Method | Description |
 | --- | --- |
-| `initWithConfig(options)` | Optional. Initializes the Rust runtime with custom settings (e.g., `workerThreads`). Must be called before any other operation. |
+| `initWithConfig(options)` | Optional. Initializes the Rust runtime with custom settings (e.g., `workerThreads`, `debug`). Must be called before any other operation. |
 | `setVerbose(bool)` | Toggle detailed logging for JS, C++, and Rust. |
 | `isIP(string)` | Returns `0`, `4`, or `6`. |
 
@@ -159,8 +211,9 @@ We have implemented several critical fixes to ensure production-grade stability:
 | `close()` | Stops the server and **destroys all active connections**. |
 | `address()` | Returns the bound address (crucial for dynamic ports). |
 | `getConnections(cb)`| Get count of active connections. |
+| `renegotiate(opt, cb)`| **Shim**: Returns `ERR_TLS_RENEGOTIATION_DISABLED` (Rustls security policy). |
 
-**Events**: `listening`, `connection`, `error`, `close`.
+**Events**: `listening`, `connection`, `error`, `close`, `connect` (HTTP Tunneling).
 
 ### `tls.Server`
 *Extends `net.Server`*

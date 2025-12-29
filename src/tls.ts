@@ -1,6 +1,13 @@
-import { Socket, Server as NetServer, SocketOptions } from './index'
+import { Socket, Server as NetServer, SocketOptions, isVerbose } from './index'
 import { Driver } from './Driver'
 import { NetSocketDriver } from './Net.nitro'
+
+function debugLog(message: string) {
+    if (isVerbose()) {
+        const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
+        console.log(`[NET DEBUG ${timestamp}] ${message}`);
+    }
+}
 
 export interface PeerCertificate {
     subject: { [key: string]: string }
@@ -26,6 +33,13 @@ export interface ConnectionOptions extends SocketOptions {
     pfx?: string | ArrayBuffer
     passphrase?: string
     keylog?: boolean // Enable keylogging (SSLKEYLOGFILE format)
+    /**
+     * Custom hostname verification function.
+     * If provided, it will be called after the TLS handshake to verify the peer certificate.
+     * Return `undefined` if valid, or an `Error` if invalid.
+     * If not provided, the default `checkServerIdentity` is used.
+     */
+    checkServerIdentity?: (hostname: string, cert: PeerCertificate) => Error | undefined
 }
 
 export interface SecureContextOptions {
@@ -179,13 +193,50 @@ export class TLSSocket extends Socket {
 
     renegotiate(options: any, callback: (err: Error | null) => void): boolean {
         if (callback) {
-            process.nextTick(() => callback(new Error('Renegotiation is not supported by rustls')));
+            setTimeout(() => {
+                const err = new Error('Renegotiation is not supported by rustls');
+                (err as any).code = 'ERR_TLS_RENEGOTIATION_DISABLED';
+                callback(err);
+            }, 0);
         }
         return false;
     }
 
     disableRenegotiation(): void {
         // No-op, already effectively disabled
+    }
+
+    /**
+     * Enables trace output for this socket.
+     */
+    enableTrace(): void {
+        const driver = (this as any)._driver as NetSocketDriver
+        if (driver) {
+            driver.enableTrace()
+        }
+    }
+
+    /**
+     * Exports keying material for use by external protocols.
+     * 
+     * @param length The number of bytes to return.
+     * @param label A label identifying the keying material.
+     * @param context An optional context.
+     * @returns Buffer containing keying material.
+     * @throws Error if export fails (e.g., TLS not connected).
+     */
+    exportKeyingMaterial(length: number, label: string, context?: Buffer): Buffer {
+        const driver = (this as any)._driver as NetSocketDriver
+        if (driver) {
+            const ctx = context ? new Uint8Array(context).buffer as ArrayBuffer : undefined
+            const result = driver.exportKeyingMaterial(length, label, ctx)
+            if (result) {
+                return Buffer.from(result)
+            }
+        }
+        const err = new Error('exportKeyingMaterial failed: TLS connection may not be established')
+            ; (err as any).code = 'ERR_TLS_EXPORT_KEYING_MATERIAL'
+        throw err
     }
 
     constructor(socket: Socket, options?: ConnectionOptions)
@@ -230,6 +281,21 @@ export class TLSSocket extends Socket {
             if (connectionListener) this.once('secureConnect', connectionListener);
 
             this.once('connect', () => {
+                // After the native TLS handshake, perform hostname verification
+                if (rejectUnauthorized !== false) {
+                    const cert = this.getPeerCertificate() as PeerCertificate;
+                    if (cert && Object.keys(cert).length > 0) {
+                        const verifyFn = (typeof options === 'object' && options.checkServerIdentity)
+                            ? options.checkServerIdentity
+                            : checkServerIdentity;
+                        const verifyErr = verifyFn(servername, cert);
+                        if (verifyErr) {
+                            this.emit('error', verifyErr);
+                            this.destroy(verifyErr);
+                            return;
+                        }
+                    }
+                }
                 this.emit('secureConnect')
             })
 
@@ -255,14 +321,18 @@ export class TLSSocket extends Socket {
 
             if (path) {
                 if (secureContextId !== undefined) {
+                    debugLog(`TLSSocket.connect: Calling driver.connectUnixTLSWithContext(${path}, ${servername}, ctx=${secureContextId})`);
                     driver.connectUnixTLSWithContext(path, servername, rejectUnauthorized, secureContextId)
                 } else {
+                    debugLog(`TLSSocket.connect: Calling driver.connectUnixTLS(${path}, ${servername})`);
                     driver.connectUnixTLS(path, servername, rejectUnauthorized)
                 }
             } else {
                 if (secureContextId !== undefined) {
+                    debugLog(`TLSSocket.connect: Calling driver.connectTLSWithContext(${host}, ${port}, ${servername}, ctx=${secureContextId})`);
                     driver.connectTLSWithContext(host, port, servername, rejectUnauthorized, secureContextId)
                 } else {
+                    debugLog(`TLSSocket.connect: Calling driver.connectTLS(${host}, ${port}, ${servername})`);
                     driver.connectTLS(host, port, servername, rejectUnauthorized)
                 }
             }
@@ -323,6 +393,9 @@ export class Server extends NetServer {
                 key: options.key,
                 ca: options.ca
             }).id;
+        } else {
+            // Create empty secure context to allow late configuration (addContext)
+            this._secureContextId = createSecureContext().id;
         }
 
         this.on('connection', (socket: Socket) => {
@@ -408,11 +481,14 @@ export class Server extends NetServer {
 
         const driver = (this as any)._driver;
 
-        if (handle || _path) {
-            console.warn("TLS over Unix sockets/handles not fully implemented yet");
+        if (_path) {
+            driver.listenTLSUnix(_path, this._secureContextId, _backlog);
+        } else if (handle) {
+            console.warn("TLS over handles not fully implemented yet");
+            driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
+        } else {
+            driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
         }
-
-        driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
 
         return this;
     }

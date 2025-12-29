@@ -50,6 +50,8 @@ export interface NetSocketDriver extends HybridObject<{ ios: 'swift', android: '
     destroy(): void
     resetAndDestroy(): void
     enableKeylog(): void
+    enableTrace(): void
+    exportKeyingMaterial(length: number, label: string, context?: ArrayBuffer): ArrayBuffer | undefined
     setNoDelay(enable: boolean): void
     setKeepAlive(enable: boolean, delay: number): void
     getLocalAddress(): string
@@ -69,6 +71,7 @@ export interface NetServerDriver extends HybridObject<{ ios: 'swift', android: '
     listen(port: number, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
     listenTLS(port: number, secureContextId: number, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
     listenUnix(path: string, backlog?: number): void
+    listenTLSUnix(path: string, secureContextId: number, backlog?: number): void
     /**
      * Listen on an existing file descriptor (handle)
      * @param fd File descriptor of an already-bound TCP listener
@@ -80,6 +83,15 @@ export interface NetServerDriver extends HybridObject<{ ios: 'swift', android: '
     close(): void
 }
 
+export interface HttpParser extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
+    /**
+     * Feed data to the parser
+     * @param data Raw byte data from the network
+     * @returns JSON string of the parsed message if complete, empty string if partial, or error message starting with 'ERROR:'
+     */
+    feed(data: ArrayBuffer): string
+}
+
 /**
  * Runtime configuration for the network module
  */
@@ -89,11 +101,16 @@ export interface NetConfig {
      * 0 = use CPU core count (default)
      */
     workerThreads?: number
+    /**
+     * Whether to enable verbose debug logging
+     */
+    debug?: boolean
 }
 
 export interface NetDriver extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
     createSocket(id?: string): NetSocketDriver
     createServer(): NetServerDriver
+    createHttpParser(mode: number): HttpParser
     createSecureContext(cert: string, key: string, passphrase?: string): number
     createEmptySecureContext(): number
     addCACertToSecureContext(scId: number, ca: string): void

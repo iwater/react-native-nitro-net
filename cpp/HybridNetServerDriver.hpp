@@ -63,6 +63,13 @@ public:
     net_listen_unix(_id, path.c_str(), static_cast<int>(backlog.value_or(128)));
   }
 
+  void listenTLSUnix(const std::string &path, double secureContextId,
+                     std::optional<double> backlog) override {
+    net_listen_tls_unix(_id, path.c_str(),
+                        static_cast<int>(backlog.value_or(128)),
+                        static_cast<uint32_t>(secureContextId));
+  }
+
   void listenHandle(double fd, std::optional<double> backlog) override {
     net_listen_handle(_id, static_cast<int>(fd),
                       static_cast<int>(backlog.value_or(128)));
