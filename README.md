@@ -2,6 +2,11 @@
 
 Ultra-high-performance networking to React Native by combining a memory-safe Rust core with the zero-overhead Nitro Modules JSI bridge. Provides Node.js-compatible net, tls, http(s) API.
 
+[![license](https://img.shields.io/badge/license-ISC-blue.svg)]()
+[![platform](https://img.shields.io/badge/platform-ios%20%7C%20android-lightgrey.svg)]()
+[![compatibility](https://img.shields.io/badge/Node.js-100%25%20dns-green.svg)]()
+[中文文档](./README_zh.md)
+
 ## Features
 
 *   🚀 **High Performance**: Built on top of Rust's `tokio` asynchronous runtime.
