@@ -1,7 +1,5 @@
 import * as http from './http'
 import * as tls from './tls'
-import { Driver } from './Driver'
-import { Buffer } from 'react-native-nitro-buffer'
 import { IncomingMessage } from './http'
 
 // ========== Server ==========

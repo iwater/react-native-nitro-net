@@ -1,4 +1,4 @@
-import { Socket, Server as NetServer, SocketOptions, isVerbose } from './index'
+import { Socket, Server as NetServer, SocketOptions, isVerbose } from './net'
 import { Driver } from './Driver'
 import { NetSocketDriver } from './Net.nitro'
 

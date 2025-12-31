@@ -1,10 +1,9 @@
-import { Duplex, Writable, Readable } from 'readable-stream'
+import { Writable, Readable } from 'readable-stream'
 import { EventEmitter } from 'eventemitter3'
 import { Driver } from './Driver'
-import { Socket, isVerbose } from './index'
+import { Socket, isVerbose } from './net'
 import { TLSSocket } from './tls'
 import { Buffer } from 'react-native-nitro-buffer'
-import type { HttpParser } from './Net.nitro'
 
 function debugLog(message: string) {
     if (isVerbose()) {
@@ -418,7 +417,7 @@ export class Server extends EventEmitter {
     constructor(options?: ServerOptions | ((req: IncomingMessage, res: ServerResponse) => void), requestListener?: (req: IncomingMessage, res: ServerResponse) => void) {
         super();
         // Use net.Server from index.ts
-        const { Server: NetServer } = require('./index');
+        const { Server: NetServer } = require('./net');
         this._netServer = new NetServer();
 
         let listener: ((req: IncomingMessage, res: ServerResponse) => void) | undefined;
