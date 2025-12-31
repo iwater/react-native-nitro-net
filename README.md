@@ -4,7 +4,7 @@ Ultra-high-performance networking to React Native by combining a memory-safe Rus
 
 [![license](https://img.shields.io/badge/license-ISC-blue.svg)]()
 [![platform](https://img.shields.io/badge/platform-ios%20%7C%20android-lightgrey.svg)]()
-[![compatibility](https://img.shields.io/badge/Node.js-100%25%20dns-green.svg)]()
+[![compatibility](https://img.shields.io/badge/Node.js-100%25%20net-green.svg)]()
 [中文文档](./README_zh.md)
 
 ## Features
