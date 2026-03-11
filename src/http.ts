@@ -8,7 +8,7 @@ import { Buffer } from 'react-native-nitro-buffer'
 function debugLog(message: string) {
     if (isVerbose()) {
         const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
-        console.log(`[HTTP DEBUG ${timestamp}] ${message}`);
+        debugLog(`[HTTP DEBUG ${timestamp}] ${message}`);
     }
 }
 
@@ -572,7 +572,7 @@ export class Server extends EventEmitter {
                 if (!result || result === '' || result.startsWith('ERROR:')) {
                     // Empty result (partial) or error - exit loop
                     if (result && result.startsWith('ERROR:')) {
-                        console.log(`[HTTP] Server: Parser error: ${result}`);
+                        debugLog(`[HTTP] Server: Parser error: ${result}`);
                     }
                     break;
                 }
@@ -986,7 +986,7 @@ export class ClientRequest extends OutgoingMessage {
             this.socket = socket;
             this._connected = true;
             this.emit('socket', this.socket);
-            this._sendRequest();
+            // DO NOT call _sendRequest() here. Headers should only be sent once write() or end() is called.
             this._flushPendingWrites();
             this._attachSocketListeners();
         } else {
@@ -1004,7 +1004,7 @@ export class ClientRequest extends OutgoingMessage {
                 return;
             }
             debugLog(`ClientRequest._connect: Socket connected! socket=${!!socket}, socket._driver=${!!(socket as any)._driver}`);
-            console.log(`[HTTP] _connect: Socket connected!`);
+            debugLog(`[HTTP] _connect: Socket connected!`);
             this.socket = socket;
             this._connected = true;
             this.emit('socket', this.socket);
@@ -1030,7 +1030,7 @@ export class ClientRequest extends OutgoingMessage {
                     return;
                 }
                 const parsed = JSON.parse(result);
-                console.log(`[HTTP] _connect: Parser result: ${parsed.is_headers ? 'HEADERS' : 'DATA'}${parsed.complete ? ' (COMPLETE)' : ''}`);
+                debugLog(`[HTTP] _connect: Parser result: ${parsed.is_headers ? 'HEADERS' : 'DATA'}${parsed.complete ? ' (COMPLETE)' : ''}`);
 
                 if (parsed.is_headers) {
                     const status = parsed.status || 0;
@@ -1102,7 +1102,7 @@ export class ClientRequest extends OutgoingMessage {
                 if (!result || result === '' || result.startsWith('ERROR:')) {
                     // Empty result (partial) or error - exit loop
                     if (result && result.startsWith('ERROR:')) {
-                        console.log(`[HTTP] ClientRequest: Parser error: ${result}`);
+                        debugLog(`[HTTP] ClientRequest: Parser error: ${result}`);
                     }
                     break;
                 }
@@ -1112,13 +1112,13 @@ export class ClientRequest extends OutgoingMessage {
         };
 
         const onError = (err: Error) => {
-            console.log(`[HTTP] _connect: Socket error: ${err.message}`);
+            debugLog(`[HTTP] _connect: Socket error: ${err.message}`);
             this.emit('error', err);
             this._cleanupSocket();
         };
 
         const onClose = () => {
-            console.log(`[HTTP] _connect: Socket closed`);
+            debugLog(`[HTTP] _connect: Socket closed`);
             if (this._res && !this._res.readableEnded) this._res.push(null);
             this.emit('close');
             this._cleanupSocket();
@@ -1189,6 +1189,7 @@ export class ClientRequest extends OutgoingMessage {
     }
 
     _write(chunk: any, encoding: string, callback: (error?: Error | null) => void) {
+        this._hasBody = true;
         if (!this._connected) {
             this._pendingWrites.push({ chunk, encoding, callback });
             return;
@@ -1198,6 +1199,7 @@ export class ClientRequest extends OutgoingMessage {
     }
 
     write(chunk: any, encoding?: any, callback?: any): boolean {
+        this._hasBody = true;
         if (!this._connected) {
             this._pendingWrites.push({ chunk, encoding, callback });
             return true;
@@ -1209,6 +1211,11 @@ export class ClientRequest extends OutgoingMessage {
     end(chunk?: any, encoding?: any, callback?: any): this {
         debugLog(`ClientRequest.end() called, connected=${this._connected}, headersSent=${this.headersSent}`);
         if (chunk) {
+            this._hasBody = true;
+            if (!this.headersSent && !this.hasHeader('Content-Length')) {
+                const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding as any) : chunk.length;
+                this.setHeader('Content-Length', len);
+            }
             this.write(chunk, encoding);
         }
         this._ended = true;
