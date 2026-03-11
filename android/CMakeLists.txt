@@ -27,3 +27,8 @@ target_link_libraries(${PACKAGE_NAME}
     rust_c_net
     log # For android logging
 )
+
+# Android 15 16KB page size alignment
+if(ANDROID_ABI STREQUAL "arm64-v8a" OR ANDROID_ABI STREQUAL "x86_64")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+endif()
