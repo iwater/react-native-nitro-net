@@ -1,15 +1,14 @@
 import { Writable, Readable } from 'readable-stream'
 import { EventEmitter } from 'eventemitter3'
-import { Driver } from './Driver'
-import { Socket, isVerbose } from './net'
-import { TLSSocket } from './tls'
 import { Buffer } from 'react-native-nitro-buffer'
 
+import { Driver } from './Driver'
+import { Socket } from './net'
+import { TLSSocket } from './tls'
+import { debugLog as loggerDebugLog } from './Logger'
+
 function debugLog(message: string) {
-    if (isVerbose()) {
-        const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
-        debugLog(`[HTTP DEBUG ${timestamp}] ${message}`);
-    }
+    loggerDebugLog('HTTP', message)
 }
 
 // ========== STATUS_CODES ==========

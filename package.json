@@ -1,7 +1,7 @@
 {
     "name": "react-native-nitro-net",
     "description": "Ultra-high-performance networking to React Native by combining a memory-safe Rust core with the zero-overhead Nitro Modules JSI bridge. Provides Node.js-compatible net, tls, http(s) API.",
-    "version": "0.4.1",
+    "version": "0.4.2",
     "type": "module",
     "main": "./lib/index.js",
     "module": "./lib/index.js",

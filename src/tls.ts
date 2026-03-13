@@ -1,12 +1,10 @@
-import { Socket, Server as NetServer, SocketOptions, isVerbose } from './net'
+import { Socket, Server as NetServer, SocketOptions } from './net'
 import { Driver } from './Driver'
 import { NetSocketDriver } from './Net.nitro'
+import { debugLog as loggerDebugLog } from './Logger'
 
 function debugLog(message: string) {
-    if (isVerbose()) {
-        const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
-        console.log(`[NET DEBUG ${timestamp}] ${message}`);
-    }
+    loggerDebugLog('TLS', message)
 }
 
 export interface PeerCertificate {

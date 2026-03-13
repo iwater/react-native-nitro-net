@@ -1,9 +1,11 @@
 import { Duplex, DuplexOptions } from 'readable-stream'
 import { EventEmitter } from 'eventemitter3'
+import { Buffer } from 'react-native-nitro-buffer'
+
 import { Driver } from './Driver'
 import type { NetSocketDriver, NetServerDriver, NetConfig } from './Net.nitro'
 import { NetSocketEvent, NetServerEvent } from './Net.nitro'
-import { Buffer } from 'react-native-nitro-buffer'
+import { isVerbose, setVerbose, debugLog as loggerDebugLog } from './Logger'
 
 // -----------------------------------------------------------------------------
 // Utils
@@ -30,22 +32,12 @@ function isIPv6(input: string): boolean {
 // -----------------------------------------------------------------------------
 
 let _autoSelectFamilyDefault = 4; // Node default is usually 4/6 independent, but we mock it.
-let _isVerbose = false;
 let _isInitialized = false;
 
-function isVerbose(): boolean {
-    return _isVerbose;
-}
 
-function setVerbose(enabled: boolean): void {
-    _isVerbose = enabled;
-}
 
 function debugLog(message: string) {
-    if (_isVerbose) {
-        const timestamp = new Date().toISOString().split('T')[1].split('Z')[0];
-        console.log(`[NET DEBUG ${timestamp}] ${message}`);
-    }
+    loggerDebugLog('NET', message)
 }
 
 function getDefaultAutoSelectFamily(): number {
