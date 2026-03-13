@@ -586,7 +586,14 @@ export class Socket extends Duplex {
     end(chunk: any, encoding: string, cb?: () => void): this;
     end(chunk?: any, encoding?: any, cb?: any): this {
         debugLog(`Socket (localPort: ${this.localPort}) .end() called`);
-        return super.end(chunk, encoding, cb);
+        if (typeof chunk === 'function') {
+            super.end(chunk);
+        } else if (chunk == null) {
+            super.end(cb);
+        } else {
+            super.end(chunk, encoding, cb);
+        }
+        return this;
     }
 
     _write(chunk: any, encoding: string, callback: (error?: Error | null) => void): void {

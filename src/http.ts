@@ -297,7 +297,7 @@ export class OutgoingMessage extends Writable {
         if (chunk) {
             this.write(chunk, encoding);
         }
-        super.end(undefined, undefined, callback);
+        super.end(callback);
         return this;
     }
 
@@ -367,10 +367,13 @@ export class ServerResponse extends OutgoingMessage {
             }
             this._sendResponseHeaders();
         }
-        // super.end will trigger _write if chunk was provided.
-        super.end(chunk, encoding, () => {
-            if (callback) callback();
-        });
+        if (typeof chunk === 'function') {
+            super.end(chunk);
+        } else if (chunk == null) {
+            super.end(callback);
+        } else {
+            super.end(chunk, encoding, callback);
+        }
         return this;
     }
 }
@@ -1226,7 +1229,7 @@ export class ClientRequest extends OutgoingMessage {
                 this._sendRequest();
             }
             // Call super.end only when connected
-            super.end(undefined, undefined, callback);
+            super.end(callback);
         } else {
             // Socket not connected yet - _flushPendingWrites will handle ending
             // Store callback if provided
