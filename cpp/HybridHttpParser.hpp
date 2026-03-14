@@ -19,42 +19,70 @@ public:
 
   ~HybridHttpParser() { net_http_parser_destroy(_id); }
 
-  std::string feed(const std::shared_ptr<ArrayBuffer> &data) override {
+  HttpParsedMessage feed(const std::shared_ptr<ArrayBuffer> &data) override {
     if (!data)
-      return "";
+      return HttpParsedMessage("", std::nullopt);
 
-    char buf[4096];
-    int res =
-        net_http_parser_feed(_id, data->data(), data->size(), buf, sizeof(buf));
+    char jsonBuf[8192];
+    int res = net_http_parser_feed(_id, data->data(), data->size(), jsonBuf,
+                                   sizeof(jsonBuf));
 
     if (res > 0) {
-      // Complete message
-      return std::string(buf, res);
+      // JSON Metadata successfully retrieved
+      std::string metadata(jsonBuf, res);
+
+      // Check if there is a body to fetch
+      size_t bodyLen = net_http_parser_get_body(_id, nullptr, 0);
+      std::optional<std::shared_ptr<ArrayBuffer>> body = std::nullopt;
+
+      if (bodyLen > 0) {
+        // Allocate and copy body
+        auto ab = ArrayBuffer::allocate(bodyLen);
+        net_http_parser_get_body(_id, ab->data(), bodyLen);
+        body = ab;
+      }
+
+      return HttpParsedMessage(metadata, body);
     } else if (res == 0) {
       // Partial message
-      return "";
+      return HttpParsedMessage("", std::nullopt);
     } else if (res < -3) {
       // Buffer too small, required size is -res
       size_t requiredSize = static_cast<size_t>(-res);
-      std::string largerBuf(requiredSize, '\0');
-      res = net_http_parser_feed(_id, nullptr, 0, &largerBuf[0],
+      std::vector<char> largerBuf(requiredSize + 1);
+      res = net_http_parser_feed(_id, nullptr, 0, largerBuf.data(),
                                  requiredSize + 1);
       if (res > 0) {
-        return std::string(largerBuf.data(), res);
+        std::string metadata(largerBuf.data(), res);
+        size_t bodyLen = net_http_parser_get_body(_id, nullptr, 0);
+        std::optional<std::shared_ptr<ArrayBuffer>> body = std::nullopt;
+        if (bodyLen > 0) {
+          auto ab = ArrayBuffer::allocate(bodyLen);
+          net_http_parser_get_body(_id, ab->data(), bodyLen);
+          body = ab;
+        }
+        return HttpParsedMessage(metadata, body);
       }
-      return "ERROR: Re-parse failed after enlarging buffer";
+      return HttpParsedMessage("ERROR: Re-parse failed after enlarging buffer",
+                               std::nullopt);
     } else {
       // Error
+      std::string error;
       switch (res) {
       case -1:
-        return "ERROR: JSON serialization failed";
+        error = "ERROR: JSON serialization failed";
+        break;
       case -2:
-        return "ERROR: HTTP parse failed";
+        error = "ERROR: HTTP parse failed";
+        break;
       case -3:
-        return "ERROR: Parser not found";
+        error = "ERROR: Parser not found";
+        break;
       default:
-        return "ERROR: Unknown error";
+        error = "ERROR: Unknown error";
+        break;
       }
+      return HttpParsedMessage(error, std::nullopt);
     }
   }
 

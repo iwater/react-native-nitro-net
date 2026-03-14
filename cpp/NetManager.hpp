@@ -102,32 +102,38 @@ private:
     // Log all events for debugging
     const char *eventName = "UNKNOWN";
     switch (eventType) {
-    case 1:
+    case NET_EVENT_CONNECT:
       eventName = "CONNECT";
       break;
-    case 2:
+    case NET_EVENT_DATA:
       eventName = "DATA";
       break;
-    case 3:
+    case NET_EVENT_ERROR:
       eventName = "ERROR";
       break;
-    case 4:
+    case NET_EVENT_CLOSE:
       eventName = "CLOSE";
       break;
-    case 5:
+    case NET_EVENT_WRITTEN:
       eventName = "DRAIN";
       break;
-    case 6:
+    case NET_EVENT_CONNECTION:
       eventName = "CONNECTION";
       break;
-    case 7:
+    case NET_EVENT_TIMEOUT:
       eventName = "TIMEOUT";
       break;
-    case 8:
+    case NET_EVENT_LOOKUP:
       eventName = "LOOKUP";
       break;
-    case 9:
-      eventName = "DEBUG";
+    case NET_EVENT_SESSION:
+      eventName = "SESSION";
+      break;
+    case NET_EVENT_KEYLOG:
+      eventName = "KEYLOG";
+      break;
+    case NET_EVENT_OCSP:
+      eventName = "OCSP";
       break;
     }
 

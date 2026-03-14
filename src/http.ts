@@ -468,14 +468,18 @@ export class Server extends EventEmitter {
         }
 
         const onData = (data: Buffer) => {
-            const handleParsedResult = (result: string) => {
-                if (result.startsWith('ERROR:')) {
+            const handleParsedResult = (result: any) => {
+                const metadata = result.metadata;
+                if (metadata.startsWith('ERROR:')) {
                     if (headersTimer) clearTimeout(headersTimer);
-                    this.emit('error', new Error(result));
+                    this.emit('error', new Error(metadata));
                     socket.destroy();
                     return;
                 }
-                const parsed = JSON.parse(result);
+                const parsed = JSON.parse(metadata);
+                if (result.body) {
+                    parsed.body = Buffer.from(result.body);
+                }
 
                 if (parsed.is_headers) {
                     if (headersTimer) {
@@ -567,14 +571,15 @@ export class Server extends EventEmitter {
 
             let input: ArrayBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
             let iterations = 0;
-            const maxIterations = 100; // Safety limit
+            const maxIterations = 2000; // Safety limit
             while (iterations < maxIterations) {
                 iterations++;
                 const result = parser.feed(input);
-                if (!result || result === '' || result.startsWith('ERROR:')) {
+                const metadata = result.metadata;
+                if (!metadata || metadata === '' || metadata.startsWith('ERROR:')) {
                     // Empty result (partial) or error - exit loop
-                    if (result && result.startsWith('ERROR:')) {
-                        debugLog(`[HTTP] Server: Parser error: ${result}`);
+                    if (metadata && metadata.startsWith('ERROR:')) {
+                        debugLog(`[HTTP] Server: Parser error: ${metadata}`);
                     }
                     break;
                 }
@@ -1025,13 +1030,17 @@ export class ClientRequest extends OutgoingMessage {
         const parser = Driver.createHttpParser(1); // 1 = Response mode
 
         const onData = (data: Buffer) => {
-            const handleParsedResult = (result: string) => {
-                if (result.startsWith('ERROR:')) {
-                    this.emit('error', new Error(result));
+            const handleParsedResult = (result: any) => {
+                const metadata = result.metadata;
+                if (metadata.startsWith('ERROR:')) {
+                    this.emit('error', new Error(metadata));
                     this.socket!.destroy();
                     return;
                 }
-                const parsed = JSON.parse(result);
+                const parsed = JSON.parse(metadata);
+                if (result.body) {
+                    parsed.body = Buffer.from(result.body);
+                }
                 debugLog(`[HTTP] _connect: Parser result: ${parsed.is_headers ? 'HEADERS' : 'DATA'}${parsed.complete ? ' (COMPLETE)' : ''}`);
 
                 if (parsed.is_headers) {
@@ -1097,14 +1106,15 @@ export class ClientRequest extends OutgoingMessage {
 
             let input: ArrayBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
             let iterations = 0;
-            const maxIterations = 100; // Safety limit
+            const maxIterations = 2000; // Safety limit
             while (iterations < maxIterations) {
                 iterations++;
                 const result = parser.feed(input);
-                if (!result || result === '' || result.startsWith('ERROR:')) {
+                const metadata = result.metadata;
+                if (!metadata || metadata === '' || metadata.startsWith('ERROR:')) {
                     // Empty result (partial) or error - exit loop
-                    if (result && result.startsWith('ERROR:')) {
-                        debugLog(`[HTTP] ClientRequest: Parser error: ${result}`);
+                    if (metadata && metadata.startsWith('ERROR:')) {
+                        debugLog(`[HTTP] ClientRequest: Parser error: ${metadata}`);
                     }
                     break;
                 }

@@ -82,14 +82,18 @@ export interface NetServerDriver extends HybridObject<{ ios: 'swift', android: '
     maxConnections: number
     close(): void
 }
+export interface HttpParsedMessage {
+    metadata: string
+    body?: ArrayBuffer
+}
 
 export interface HttpParser extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
     /**
      * Feed data to the parser
      * @param data Raw byte data from the network
-     * @returns JSON string of the parsed message if complete, empty string if partial, or error message starting with 'ERROR:'
+     * @returns HttpParsedMessage containing the JSON metadata and optional binary body
      */
-    feed(data: ArrayBuffer): string
+    feed(data: ArrayBuffer): HttpParsedMessage
 }
 
 /**
