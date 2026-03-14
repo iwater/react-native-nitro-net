@@ -145,9 +145,6 @@ export class OutgoingMessage extends Writable {
     constructor() {
         // @ts-ignore - disable autoDestroy to prevent socket from being destroyed when stream ends
         super({ autoDestroy: false });
-        this.once('finish', () => {
-            this.emit('close');
-        });
     }
 
     public destroy(error?: Error): this {
@@ -319,6 +316,16 @@ export class ServerResponse extends OutgoingMessage {
     constructor(socket: Socket) {
         super();
         this.socket = socket;
+
+        const onClose = () => {
+            if (this.socket) {
+                this.socket.removeListener('close', onClose);
+            }
+            this.removeListener('finish', onClose);
+            this.emit('close');
+        };
+        this.once('finish', onClose);
+        this.socket.once('close', onClose);
     }
 
     writeHead(statusCode: number, statusMessage?: string | Record<string, any>, headers?: Record<string, any>): this {
@@ -1161,6 +1168,7 @@ export class ClientRequest extends OutgoingMessage {
         const socket = this.socket;
         this._cleanupSocket();
         if (socket) agent.releaseSocket(socket, this._options);
+        this.emit('close');
     }
 
     private _flushPendingWrites() {

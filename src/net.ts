@@ -335,9 +335,6 @@ export class Socket extends Duplex {
             // resume() will be called after 'connect' event in _connect()
         }
 
-        this.on('finish', () => {
-            // Writable side finished
-        });
     }
 
     on(event: string | symbol, listener: (...args: any[]) => void): this {
