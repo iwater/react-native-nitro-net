@@ -27,6 +27,18 @@ function isIPv4(input: string): boolean {
 function isIPv6(input: string): boolean {
     return isIP(input) === 6;
 }
+
+/**
+ * Decodes an ArrayBuffer to a string.
+ * Prioritizes TextDecoder if available, otherwise falls back to Buffer.
+ */
+function decodeArrayBuffer(data: ArrayBuffer | undefined): string {
+    if (!data || data.byteLength === 0) return '';
+    if (typeof TextDecoder !== 'undefined') {
+        return new TextDecoder().decode(data);
+    }
+    return Buffer.from(data).toString();
+}
 // -----------------------------------------------------------------------------
 // Global Configuration
 // -----------------------------------------------------------------------------
@@ -355,11 +367,11 @@ export class Socket extends Duplex {
         const id = (this._driver as any).id ?? (this._driver as any)._id;
         this._driver.onEvent = (eventType: number, data: ArrayBuffer) => {
             this.emit('event', eventType, data);
-            if (eventType === 3) { // ERROR
-                const msg = new TextDecoder().decode(data);
+            if (eventType === NetSocketEvent.ERROR) {
+                const msg = decodeArrayBuffer(data) || 'Unknown error';
                 debugLog(`Socket (id: ${id}) NATIVE ERROR: ${msg}`);
             }
-            if (eventType === 9) { // SESSION/DEBUG
+            if (eventType === NetSocketEvent.SESSION) { // SESSION/DEBUG
                 debugLog(`Socket (id: ${id}) NATIVE SESSION EVENT RECEIVED`);
                 this.emit('session', data);
                 return;
@@ -387,7 +399,7 @@ export class Socket extends Duplex {
                     break;
                 case NetSocketEvent.ERROR: {
                     this._hadError = true;
-                    const errorMsg = data ? Buffer.from(data).toString() : 'Unknown socket error';
+                    const errorMsg = decodeArrayBuffer(data) || 'Unknown socket error';
                     const error = new Error(errorMsg);
 
                     if (this.connecting && this._autoSelectFamily) {
@@ -428,7 +440,7 @@ export class Socket extends Duplex {
                     break;
                 case NetSocketEvent.LOOKUP: {
                     if (data) {
-                        const lookupStr = Buffer.from(data).toString();
+                        const lookupStr = decodeArrayBuffer(data);
                         const parts = lookupStr.split(',');
                         if (parts.length >= 2) {
                             const [ip, family] = parts;
@@ -767,7 +779,7 @@ export class Server extends EventEmitter {
         this._driver.onEvent = (eventType: number, data: ArrayBuffer) => {
             switch (eventType) {
                 case NetServerEvent.CONNECTION: {
-                    const payload = data ? Buffer.from(data).toString() : '';
+                    const payload = decodeArrayBuffer(data);
                     if (payload === 'success') {
                         this.emit('listening');
                     } else {
@@ -825,7 +837,7 @@ export class Server extends EventEmitter {
                     break;
                 }
                 case NetServerEvent.ERROR:
-                    this.emit('error', new Error(data ? Buffer.from(data).toString() : 'Unknown server error'));
+                    this.emit('error', new Error(decodeArrayBuffer(data) || 'Unknown server error'));
                     break;
                 case NetServerEvent.DEBUG: {
                     debugLog(`Server NATIVE SESSION/DEBUG EVENT RECEIVED`);
