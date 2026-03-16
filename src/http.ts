@@ -289,8 +289,16 @@ export class OutgoingMessage extends Writable {
     }
 
     end(chunk?: any, encoding?: any, callback?: any): this {
-        debugLog(`OutgoingMessage.end() called, already ending: ${(this as any)._writableState?.ending}, chunk: ${!!chunk}`);
-        if (chunk) {
+        if (typeof chunk === 'function') {
+            callback = chunk;
+            chunk = null;
+            encoding = null;
+        } else if (typeof encoding === 'function') {
+            callback = encoding;
+            encoding = null;
+        }
+
+        if (chunk != null) {
             this.write(chunk, encoding);
         }
         super.end(callback);
@@ -362,24 +370,31 @@ export class ServerResponse extends OutgoingMessage {
     }
 
     end(chunk?: any, encoding?: any, callback?: any): this {
+        if (typeof chunk === 'function') {
+            callback = chunk;
+            chunk = null;
+            encoding = null;
+        } else if (typeof encoding === 'function') {
+            callback = encoding;
+            encoding = null;
+        }
+
         if (!this.headersSent) {
             // If we have a single chunk and no headers sent yet, we can add Content-Length
             // to avoid chunked encoding for simple responses.
-            if (chunk) {
-                const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding) : chunk.length;
+            if (chunk != null) {
+                const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, (encoding as string) || undefined) : chunk.length;
                 this.setHeader('Content-Length', len);
-            } else {
+            } else if (!this.hasHeader('Transfer-Encoding')) {
                 this.setHeader('Content-Length', 0);
             }
             this._sendResponseHeaders();
         }
-        if (typeof chunk === 'function') {
-            super.end(chunk);
-        } else if (chunk == null) {
-            super.end(callback);
-        } else {
-            super.end(chunk, encoding, callback);
+
+        if (chunk != null) {
+            this.write(chunk, encoding);
         }
+        super.end(callback);
         return this;
     }
 }
@@ -954,6 +969,25 @@ export class ClientRequest extends OutgoingMessage {
     private _expectContinue: boolean = false;
     private _continueReceived: boolean = false;
 
+    private _getChunkByteLength(chunk: any, encoding?: string | null): number {
+        if (chunk == null) return 0;
+        const normalizedEncoding = typeof encoding === 'string' ? encoding : undefined;
+        if (typeof chunk === 'string') {
+            return Buffer.byteLength(chunk, normalizedEncoding as BufferEncoding | undefined);
+        }
+        if (typeof chunk.length === 'number') {
+            return chunk.length;
+        }
+        const buffer = Buffer.from(chunk, normalizedEncoding as BufferEncoding | undefined);
+        return buffer.length;
+    }
+
+    private _getPendingBodyLength(): number {
+        return this._pendingWrites.reduce((total, pending) => {
+            return total + this._getChunkByteLength(pending.chunk, pending.encoding);
+        }, 0);
+    }
+
     constructor(options: RequestOptions, callback?: (res: IncomingMessage) => void) {
         super();
         this._options = options;
@@ -1171,28 +1205,43 @@ export class ClientRequest extends OutgoingMessage {
         this.emit('close');
     }
 
+    private _isFlushing = false;
     private _flushPendingWrites() {
-        if (!this.socket) return;
-        if (!this.headersSent) this._sendRequest();
+        if (!this.socket || this._isFlushing) return;
+        
+        this._isFlushing = true;
+        try {
+            if (!this.headersSent) this._sendRequest();
 
-        // If we are waiting for 100-continue, don't flush yet
-        if (this._expectContinue && !this._continueReceived) {
-            return;
-        }
+            // If we are waiting for 100-continue, don't flush yet
+            if (this._expectContinue && !this._continueReceived) {
+                return;
+            }
 
-        const writes = this._pendingWrites;
-        this._pendingWrites = [];
-        for (const pending of writes) {
-            this._write(pending.chunk, pending.encoding, pending.callback);
-        }
-        if (this._ended) {
-            this._finishRequest();
+            // Keep draining the queue as long as it has items
+            // This handles writes that might happen while we are flushing (e.g. from callbacks)
+            while (this._pendingWrites.length > 0) {
+                const writes = this._pendingWrites;
+                this._pendingWrites = [];
+                for (const pending of writes) {
+                    // Call super._write (OutgoingMessage._write) directly
+                    super._write(pending.chunk, pending.encoding, pending.callback);
+                }
+            }
+            
+            if (this._ended) {
+                super.end();
+            }
+        } finally {
+            this._isFlushing = false;
         }
     }
 
+    // Simplified _finishRequest - not needed as much if we call super.end() directly
     private _finishRequest() {
-        if (!this._ended) return;
-        super.end();
+        if (this._connected && this._pendingWrites.length === 0) {
+            super.end();
+        }
     }
 
     private _sendRequest() {
@@ -1210,7 +1259,7 @@ export class ClientRequest extends OutgoingMessage {
 
     _write(chunk: any, encoding: string, callback: (error?: Error | null) => void) {
         this._hasBody = true;
-        if (!this._connected) {
+        if (!this._connected || this._isFlushing) {
             this._pendingWrites.push({ chunk, encoding, callback });
             return;
         }
@@ -1220,39 +1269,47 @@ export class ClientRequest extends OutgoingMessage {
 
     write(chunk: any, encoding?: any, callback?: any): boolean {
         this._hasBody = true;
-        if (!this._connected) {
+        // If not connected OR currently flushing, enqueue to preserve order
+        if (!this._connected || this._isFlushing) {
             this._pendingWrites.push({ chunk, encoding, callback });
             return true;
         }
-        if (!this.headersSent) this._sendRequest();
         return super.write(chunk, encoding, callback);
     }
 
     end(chunk?: any, encoding?: any, callback?: any): this {
-        debugLog(`ClientRequest.end() called, connected=${this._connected}, headersSent=${this.headersSent}`);
-        if (chunk) {
+        if (typeof chunk === 'function') {
+            callback = chunk;
+            chunk = null;
+            encoding = null;
+        } else if (typeof encoding === 'function') {
+            callback = encoding;
+            encoding = null;
+        }
+
+        debugLog(`ClientRequest.end() called, connected=${this._connected}, chunk=${!!chunk}`);
+        
+        if (chunk != null) {
             this._hasBody = true;
             if (!this.headersSent && !this.hasHeader('Content-Length')) {
-                const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding as any) : chunk.length;
+                const len = this._getPendingBodyLength() + this._getChunkByteLength(chunk, encoding as string | undefined);
                 this.setHeader('Content-Length', len);
             }
+            // Use this.write to handle pending queue if not connected
             this.write(chunk, encoding);
         }
+        
         this._ended = true;
 
-        // If connected, we can send request and end immediately
         if (this._connected) {
-            if (!this.headersSent) {
-                this._sendRequest();
-            }
-            // Call super.end only when connected
-            super.end(callback);
-        } else {
-            // Socket not connected yet - _flushPendingWrites will handle ending
-            // Store callback if provided
-            if (callback) {
+            // Only end if the queue is empty. _flushPendingWrites will handle it otherwise.
+            if (this._pendingWrites.length === 0) {
+                super.end(callback);
+            } else if (callback) {
                 this.once('finish', callback);
             }
+        } else {
+            if (callback) this.once('finish', callback);
         }
         return this;
     }

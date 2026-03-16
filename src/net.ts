@@ -296,6 +296,7 @@ export class Socket extends Duplex {
     public autoSelectFamilyAttemptedAddresses: string[] = [];
     private _autoSelectFamily: boolean = false;
     private _timeout: number = 0;
+    private _nativeWriteCallbacks: Array<(error?: Error | null) => void> = [];
 
     get localFamily(): string {
         return this.localAddress && this.localAddress.includes(':') ? 'IPv6' : 'IPv4';
@@ -333,9 +334,8 @@ export class Socket extends Duplex {
             this._setupEvents();
             // Enable noDelay by default
             this._driver.setNoDelay(true);
-            // Resume the socket since it starts paused on server-accept
-            this.resume();
-            // Emit connect for server-side socket? No, it's already connected.
+            // For accepted server sockets, defer resume until after the server
+            // emits 'connection' so user handlers can attach first.
         } else {
             // New client socket
             ensureInitialized();
@@ -355,8 +355,8 @@ export class Socket extends Duplex {
             return this;
         }
         const ret = super.on(event, listener);
-        if (event === 'data' && !this.isPaused() && (this as any).readableFlowing !== true) {
-            debugLog(`Socket on('data'), flowing: ${(this as any).readableFlowing}`);
+        if (event === 'data' && (this as any).readableFlowing !== true) {
+            debugLog(`Socket on('data'), flowing: ${(this as any).readableFlowing}, paused: ${this.isPaused()}`);
             this.resume();
         }
         return ret;
@@ -392,8 +392,10 @@ export class Socket extends Duplex {
                     if (data && data.byteLength > 0) {
                         const buffer = Buffer.from(data);
                         this.bytesRead += buffer.length;
-                        if (!this.push(buffer)) {
-                            this.pause();
+                        this.push(buffer);
+                        if (this.listenerCount('data') > 0 && (this as any).readableFlowing !== true) {
+                            debugLog(`Socket onEvent(DATA) restoring flowing mode for attached 'data' listeners`);
+                            this.resume();
                         }
                     }
                     break;
@@ -422,6 +424,11 @@ export class Socket extends Duplex {
                     this._connected = false;
                     this.connecting = false;
                     this.push(null); // EOF
+                    if (!(this as any).allowHalfOpen && !this.writableEnded && !this.destroyed) {
+                        // Match Node's default behavior: half-close the writable side
+                        // when the peer finishes and allowHalfOpen is false.
+                        this.end();
+                    }
                     this.emit('close', this._hadError);
                     break;
                 case NetSocketEvent.DRAIN:
@@ -582,24 +589,39 @@ export class Socket extends Duplex {
         return this;
     }
 
-    end(cb?: () => void): this;
-    end(chunk: any, cb?: () => void): this;
-    end(chunk: any, encoding: string, cb?: () => void): this;
     end(chunk?: any, encoding?: any, cb?: any): this {
-        debugLog(`Socket (localPort: ${this.localPort}) .end() called`);
         if (typeof chunk === 'function') {
-            super.end(chunk);
-        } else if (chunk == null) {
-            super.end(cb);
-        } else {
-            super.end(chunk, encoding, cb);
+            cb = chunk;
+            chunk = null;
+            encoding = null;
+        } else if (typeof encoding === 'function') {
+            cb = encoding;
+            encoding = null;
         }
+        debugLog(`Socket (localPort: ${this.localPort}) .end() called`);
+        if (chunk != null) {
+            this.write(chunk, encoding);
+        }
+        super.end(cb);
         return this;
     }
 
     _write(chunk: any, encoding: string, callback: (error?: Error | null) => void): void {
         if (!this._driver) {
             return callback(new Error('Socket not connected'));
+        }
+        if (!this._connected && this.connecting) {
+            const onConnect = () => {
+                this.removeListener('error', onError);
+                this._write(chunk, encoding, callback);
+            };
+            const onError = (err: Error) => {
+                this.removeListener('connect', onConnect);
+                callback(err);
+            };
+            this.once('connect', onConnect);
+            this.once('error', onError);
+            return;
         }
         try {
             const buffer = (chunk instanceof Buffer) ? chunk : Buffer.from(chunk, encoding as any);
@@ -618,9 +640,24 @@ export class Socket extends Duplex {
     }
 
     _final(callback: (error?: Error | null) => void): void {
-        if (this._driver) {
-            this._driver.shutdown();
+        if (!this._driver) {
+            return callback(null);
         }
+        if (!this._connected && this.connecting) {
+            const onConnect = () => {
+                this.removeListener('error', onError);
+                this._final(callback);
+            };
+            const onError = () => {
+                this.removeListener('connect', onConnect);
+                callback(null); // Already destroyed/errored
+            };
+            this.once('connect', onConnect);
+            this.once('error', onError);
+            return;
+        }
+        debugLog(`Socket (localPort: ${this.localPort}) ._final() called, shutting down driver`);
+        this._driver.shutdown();
         callback(null);
     }
 
@@ -832,6 +869,9 @@ export class Server extends EventEmitter {
                                 this._sockets.delete(socket);
                             });
                             this.emit('connection', socket);
+                            // Start reading only after 'connection' handlers ran.
+                            // This prevents dropping data when listeners are attached in the callback.
+                            socket.resume();
                         }
                     }
                     break;
