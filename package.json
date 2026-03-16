@@ -18,6 +18,7 @@
     ],
     "author": "iwater <iwater@gmail.com>",
     "license": "ISC",
+    "homepage": "https://github.com/iwater/react-native-nitro-net",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/iwater/react-native-nitro-net.git"
