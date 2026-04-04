@@ -91,6 +91,10 @@ function initWithConfig(config: NetConfig): void {
     if (config.debug !== undefined) {
         setVerbose(config.debug);
     }
+    // Inject dispatcher for async events to avoid thread starvation/deadlocks
+    if ((Driver as any).installDispatcher) {
+        (Driver as any).installDispatcher();
+    }
     Driver.initWithConfig(config);
 }
 

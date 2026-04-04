@@ -105,7 +105,14 @@ export class IncomingMessage extends Readable {
     }
 
     _read() {
-        this.socket.resume();
+        // Server-side: socket is kept flowing by _setupHttpConnection.
+        // Calling socket.resume() here is the correct Node.js backpressure pattern
+        // but only when socket is the actual data source (client-side IncomingMessage).
+        // For server-side req, body bytes come via parser→push(), not socket directly.
+        // Still call resume() to unblock if paused by backpressure, but guard it.
+        if (this.socket && !(this.socket as any)._destroyed) {
+            this.socket.resume();
+        }
     }
 
     public setTimeout(msecs: number, callback?: () => void): this {
@@ -573,16 +580,51 @@ export class Server extends EventEmitter {
                     }
                 }
 
-                if (req && parsed.body && parsed.body.length > 0) {
-                    req.push(Buffer.from(parsed.body));
-                }
+                // Push body/EOF into IncomingMessage.
+                // CRITICAL: When headers and body arrive in the same TCP packet
+                // (parsed.is_headers && body present), the user's 'request' handler
+                // has just been called synchronously above. The readable-stream
+                // library schedules its internal resume/flow via process.nextTick.
+                // If we push() synchronously here, the data lands in the buffer
+                // *before* the Readable enters flowing mode, and since no further
+                // socket data events will arrive, the flow() loop never drains it.
+                // Solution: always defer body/EOF push via process.nextTick so the
+                // Readable has a chance to enter flowing mode first.
+                const _bodyToPush = req && parsed.body && parsed.body.length > 0
+                    ? Buffer.from(parsed.body) : null;
+                const _isComplete = !!(req && parsed.complete);
+                const _trailers = parsed.trailers;
+                const _reqRef = req;
 
-                if (req && parsed.complete) {
-                    req.complete = true;
-                    if (parsed.trailers) {
-                        req.trailers = parsed.trailers;
+                // Diagnostic: log body delivery state (requires debug mode)
+                debugLog(`[Server] handleParsedResult: is_headers=${parsed.is_headers}, ` +
+                    `bodyLen=${_bodyToPush?.length ?? 0}, complete=${_isComplete}, ` +
+                    `req.readableFlowing=${(_reqRef as any)?._readableState?.flowing}`);
+
+                if (_bodyToPush !== null || _isComplete) {
+                    if (parsed.is_headers) {
+                        // Same-packet case: defer to give Readable time to enter flowing mode
+                        debugLog(`[Server] Deferring body/EOF push via setImmediate (same-packet)`);
+                        setImmediate(() => {
+                            if (!_reqRef) return;
+                            debugLog(`[Server] setImmediate: pushing body=${_bodyToPush?.length ?? 0}, EOF=${_isComplete}`);
+                            if (_bodyToPush) _reqRef.push(_bodyToPush);
+                            if (_isComplete) {
+                                _reqRef.complete = true;
+                                if (_trailers) _reqRef.trailers = _trailers;
+                                _reqRef.push(null);
+                            }
+                        });
+                    } else {
+                        // Subsequent-packet case: push immediately
+                        debugLog(`[Server] Pushing body/EOF immediately (subsequent-packet)`);
+                        if (_bodyToPush) _reqRef!.push(_bodyToPush);
+                        if (_isComplete) {
+                            _reqRef!.complete = true;
+                            if (_trailers) _reqRef!.trailers = _trailers;
+                            _reqRef!.push(null);
+                        }
                     }
-                    req.push(null);
                 }
 
                 // For Keep-Alive, try to parse remaining buffer in case of pipelining
@@ -1034,9 +1076,10 @@ export class ClientRequest extends OutgoingMessage {
             this.socket = socket;
             this._connected = true;
             this.emit('socket', this.socket);
-            // DO NOT call _sendRequest() here. Headers should only be sent once write() or end() is called.
-            this._flushPendingWrites();
+            // IMPORTANT: attach response listeners BEFORE flushing writes.
+            // If we flush first, the server may respond before we have a data listener.
             this._attachSocketListeners();
+            this._flushPendingWrites();
         } else {
             this._connect();
         }
@@ -1051,15 +1094,18 @@ export class ClientRequest extends OutgoingMessage {
                 this.emit('error', err);
                 return;
             }
-            debugLog(`ClientRequest._connect: Socket connected! socket=${!!socket}, socket._driver=${!!(socket as any)._driver}`);
-            debugLog(`[HTTP] _connect: Socket connected!`);
+            debugLog(`ClientRequest._connect: Socket connected!`);
             this.socket = socket;
             this._connected = true;
             this.emit('socket', this.socket);
-            debugLog(`ClientRequest._connect: Calling _sendRequest`);
-            this._sendRequest();
-            this._flushPendingWrites();
+            // IMPORTANT: attach response listeners BEFORE flushing writes.
+            // If we flush first, the server may respond before we have a data listener.
             this._attachSocketListeners();
+            // _flushPendingWrites() internally calls _sendRequest() if headers not sent yet.
+            // Do NOT call _sendRequest() separately here — _flushPendingWrites() needs to
+            // inspect headersSent and _pendingWrites together so it can set Content-Length
+            // before sending headers (to avoid chunked encoding when body is already known).
+            this._flushPendingWrites();
         };
 
         this.socket = agent.createConnection(this._options, connectCallback);
@@ -1208,10 +1254,31 @@ export class ClientRequest extends OutgoingMessage {
     private _isFlushing = false;
     private _flushPendingWrites() {
         if (!this.socket || this._isFlushing) return;
-        
+
         this._isFlushing = true;
         try {
-            if (!this.headersSent) this._sendRequest();
+            if (!this.headersSent) {
+                // KEY FIX: When all body data is already queued AND the request is ending,
+                // we can calculate the exact Content-Length and avoid chunked encoding.
+                //
+                // Why this matters: without Content-Length, the request is sent with
+                // Transfer-Encoding: chunked. The Rust HTTP parser on the server side
+                // stores chunked body bytes in its internal buffer after parsing headers,
+                // but calling parser.feed(empty_buffer) to drain those bytes does NOT work
+                // — the drain call returns empty metadata and the body is permanently lost.
+                //
+                // By setting Content-Length here (when we have all the data), the body is
+                // sent as raw bytes. The server parser simply reads N bytes and marks the
+                // request complete — no chunked framing, no drain issues.
+                if (this._ended
+                    && !this.hasHeader('Content-Length')
+                    && !this.hasHeader('Transfer-Encoding')
+                    && this._pendingWrites.length > 0) {
+                    const totalLen = this._getPendingBodyLength();
+                    this.setHeader('Content-Length', totalLen);
+                }
+                this._sendRequest();
+            }
 
             // If we are waiting for 100-continue, don't flush yet
             if (this._expectContinue && !this._continueReceived) {
@@ -1228,7 +1295,7 @@ export class ClientRequest extends OutgoingMessage {
                     super._write(pending.chunk, pending.encoding, pending.callback);
                 }
             }
-            
+
             if (this._ended) {
                 super.end();
             }
@@ -1288,7 +1355,7 @@ export class ClientRequest extends OutgoingMessage {
         }
 
         debugLog(`ClientRequest.end() called, connected=${this._connected}, chunk=${!!chunk}`);
-        
+
         if (chunk != null) {
             this._hasBody = true;
             if (!this.headersSent && !this.hasHeader('Content-Length')) {
@@ -1298,7 +1365,7 @@ export class ClientRequest extends OutgoingMessage {
             // Use this.write to handle pending queue if not connected
             this.write(chunk, encoding);
         }
-        
+
         this._ended = true;
 
         if (this._connected) {

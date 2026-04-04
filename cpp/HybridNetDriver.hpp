@@ -7,6 +7,7 @@
 #include "HybridNetSocketDriver.hpp"
 #include "NetManager.hpp"
 #include <NitroModules/ArrayBuffer.hpp>
+#include <jsi/jsi.h>
 #include <optional>
 #include <string>
 
@@ -19,6 +20,22 @@ using namespace margelo::nitro;
 class HybridNetDriver : public HybridNetDriverSpec {
 public:
   HybridNetDriver() : HybridObject(TAG) {}
+
+  jsi::Value installDispatcher(jsi::Runtime &runtime, const jsi::Value &,
+                               const jsi::Value *, size_t) {
+    auto dispatcher =
+        margelo::nitro::Dispatcher::getRuntimeGlobalDispatcher(runtime);
+    NetManager::shared().setDispatcher(dispatcher);
+    return jsi::Value::undefined();
+  }
+
+  void loadHybridMethods() override {
+    HybridNetDriverSpec::loadHybridMethods();
+    registerHybrids(this, [](Prototype &prototype) {
+      prototype.registerRawHybridMethod("installDispatcher", 0,
+                                        &HybridNetDriver::installDispatcher);
+    });
+  }
 
   std::shared_ptr<HybridNetSocketDriverSpec>
   createSocket(const std::optional<std::string> &id) override {

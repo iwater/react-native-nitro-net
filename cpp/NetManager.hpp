@@ -28,6 +28,9 @@
   printf("\n")
 #endif
 
+#include <NitroModules/Dispatcher.hpp>
+#include <NitroModules/NitroLogger.hpp>
+
 namespace margelo::nitro::net {
 
 class NetManager {
@@ -45,15 +48,18 @@ public:
     initializeRuntime(0); // 0 = use default (CPU core count)
   }
 
+  void setDispatcher(std::shared_ptr<margelo::nitro::Dispatcher> dispatcher) {
+    LOGI("NetManager: Dispatcher installed.");
+    _dispatcher = dispatcher;
+  }
+
   /// Initialize with custom worker thread count
-  /// Must be called before any other operations, or the config will be ignored
   void initWithConfig(uint32_t workerThreads) {
     if (!_initialized) {
       LOGI("Initializing NetManager with %u worker threads...", workerThreads);
       initializeRuntime(workerThreads);
     } else {
-      LOGW("NetManager already initialized, config ignored. Call "
-           "initWithConfig before any socket/server operations.");
+      LOGW("NetManager already initialized, config ignored.");
     }
   }
 
@@ -63,26 +69,21 @@ private:
       return;
     _initialized = true;
 
+    auto callback = [](uint32_t id, int event_type, const uint8_t *data, size_t len,
+             void *context) {
+            auto mgr = static_cast<NetManager *>(context);
+            mgr->dispatch(id, event_type, data, len);
+          };
+
     if (workerThreads > 0) {
-      net_init_with_config(
-          [](uint32_t id, int event_type, const uint8_t *data, size_t len,
-             void *context) {
-            auto mgr = static_cast<NetManager *>(context);
-            mgr->dispatch(id, event_type, data, len);
-          },
-          this, workerThreads);
+      net_init_with_config(callback, this, workerThreads);
     } else {
-      net_init(
-          [](uint32_t id, int event_type, const uint8_t *data, size_t len,
-             void *context) {
-            auto mgr = static_cast<NetManager *>(context);
-            mgr->dispatch(id, event_type, data, len);
-          },
-          this);
+      net_init(callback, this);
     }
   }
 
   bool _initialized = false;
+  std::shared_ptr<margelo::nitro::Dispatcher> _dispatcher;
 
 public:
   void registerHandler(uint32_t id, EventHandler handler) {
@@ -99,63 +100,33 @@ public:
 
 private:
   void dispatch(uint32_t id, int eventType, const uint8_t *data, size_t len) {
-    // Log all events for debugging
-    const char *eventName = "UNKNOWN";
-    switch (eventType) {
-    case NET_EVENT_CONNECT:
-      eventName = "CONNECT";
-      break;
-    case NET_EVENT_DATA:
-      eventName = "DATA";
-      break;
-    case NET_EVENT_ERROR:
-      eventName = "ERROR";
-      break;
-    case NET_EVENT_CLOSE:
-      eventName = "CLOSE";
-      break;
-    case NET_EVENT_WRITTEN:
-      eventName = "DRAIN";
-      break;
-    case NET_EVENT_CONNECTION:
-      eventName = "CONNECTION";
-      break;
-    case NET_EVENT_TIMEOUT:
-      eventName = "TIMEOUT";
-      break;
-    case NET_EVENT_LOOKUP:
-      eventName = "LOOKUP";
-      break;
-    case NET_EVENT_SESSION:
-      eventName = "SESSION";
-      break;
-    case NET_EVENT_KEYLOG:
-      eventName = "KEYLOG";
-      break;
-    case NET_EVENT_OCSP:
-      eventName = "OCSP";
-      break;
+    // 1. Prepare data (copy if needed for async)
+    std::vector<uint8_t> buffer;
+    if (data && len > 0) {
+        buffer.assign(data, data + len);
     }
 
-    LOGI("dispatch: id=%u, event=%s(%d), len=%zu", id, eventName, eventType,
-         len);
+    // 2. Define the actual dispatch logic
+    auto doDispatch = [this, id, eventType, buffer = std::move(buffer)]() {
+        EventHandler handler;
+        {
+          std::shared_lock lock(_mutex);
+          auto it = _handlers.find(id);
+          if (it != _handlers.end()) {
+            handler = it->second;
+          }
+        }
 
-    // Copy handler outside of lock to avoid deadlock
-    // (handler may call unregisterHandler which needs unique_lock)
-    EventHandler handler;
-    {
-      std::shared_lock lock(_mutex);
-      auto it = _handlers.find(id);
-      if (it != _handlers.end()) {
-        handler = it->second;
-      }
-    }
+        if (handler) {
+          handler(eventType, buffer.data(), buffer.size());
+        }
+    };
 
-    // Call handler outside of lock
-    if (handler) {
-      handler(eventType, data, len);
+    // 3. Dispatch either via JS Dispatcher (Async) or immediately (Sync fallback)
+    if (_dispatcher) {
+        _dispatcher->runAsync(std::move(doDispatch));
     } else {
-      LOGW("No handler found for id=%u, event=%s", id, eventName);
+        doDispatch();
     }
   }
 
