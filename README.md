@@ -11,6 +11,7 @@ Ultra-high-performance networking to React Native by combining a memory-safe Rus
 
 *   🚀 **High Performance**: Built on top of Rust's `tokio` asynchronous runtime.
 *   🤝 **Node.js Compatible**: Implements standard `net`, `tls`, `http`, and `https` APIs.
+*   🌐 **Fetch API**: Web-standard `fetch` implementation for modern networking.
 *   🛡️ **Modern Security**: TLS implementation powered by **Rustls 0.23** (Ring provider), supporting TLS 1.2 and 1.3.
 *   🔒 **Full Protocol Support**: Support for PEM/PFX certificates, SNI, HTTP Trailers, 100 Continue, Protocol Upgrades (101), and HTTP Tunneling (CONNECT).
 *   ⚡ **Nitro Modules**: Uses JSI for zero-overhead communication between JavaScript and Native code.
@@ -137,6 +138,24 @@ const agent = new https.Agent({ keepAlive: true });
 https.get('https://api.github.com/users/margelo', { agent }, (res) => {
   // ... handle response
 });
+```
+
+### Fetch API (Web Standard)
+
+A Web-standard `fetch` implementation that uses the high-performance Nitro Net core. It's providing consistent behavior across platforms.
+
+```typescript
+import { fetch } from 'react-native-nitro-net';
+
+const response = await fetch('https://api.example.com/data', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ key: 'value' })
+});
+
+console.log('Status:', response.status);
+const data = await response.json();
+const blob = await response.blob(); // Proper binary data support
 ```
 
 ### TCP Client (Socket)

@@ -6,6 +6,7 @@
 
 *   🚀 **高性能**: 基于 Rust 的 `tokio` 异步运行时构建。
 *   🤝 **兼容 Node.js**: 实现了标准的 `net`, `tls`, `http` 和 `https` API。
+*   🌐 **Fetch API**: 基于 Web 标准实现的 `fetch` API，适用于现代网络请求。
 *   🛡️ **现代安全**: TLS 实现由 **Rustls 0.23** (Ring provider) 驱动，支持 TLS 1.2 和 1.3。
 *   🔒 **全协议支持**: 支持 PEM/PFX 证书、SNI、HTTP Trailers、100 Continue、协议升级 (101) 以及 HTTP 隧道 (CONNECT)。
 *   ⚡ **Nitro Modules**: 使用 JSI 进行 JavaScript 和 Native 代码之间的零开销通信。
@@ -132,6 +133,24 @@ const agent = new https.Agent({ keepAlive: true });
 https.get('https://api.github.com/users/margelo', { agent }, (res) => {
   // ... 处理响应
 });
+```
+
+### Fetch API (Web 标准)
+
+基于 Nitro Net 高性能核心实现的 Web 标准 `fetch` API。提供跨平台的一致性体验。
+
+```typescript
+import { fetch } from 'react-native-nitro-net';
+
+const response = await fetch('https://api.example.com/data', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ key: 'value' })
+});
+
+console.log('状态码:', response.status);
+const data = await response.json();
+const blob = await response.blob(); // 支持二进制数据
 ```
 
 ### TCP 客户端 (Socket)
