@@ -22,6 +22,22 @@ class FetchHeaders {
   has(name: string): boolean {
     return this.headers.has(name.toLowerCase());
   }
+
+  entries(): [string, string][] {
+    return Array.from(this.headers.entries());
+  }
+
+  toJSON(): Record<string, string> {
+    return Object.fromEntries(this.headers.entries());
+  }
+
+  forEach(callback: (value: string, name: string, headers: FetchHeaders) => void): void {
+    this.headers.forEach((value, name) => callback(value, name, this));
+  }
+
+  [Symbol.iterator](): Iterator<[string, string]> {
+    return this.headers.entries();
+  }
 }
 
 // 模拟 fetch 的 Response 类型

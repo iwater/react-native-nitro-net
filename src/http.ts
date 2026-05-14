@@ -927,7 +927,7 @@ export class Agent extends EventEmitter {
             }
         } else {
             this._totalSockets--;
-            socket.end();
+            socket.destroy();
         }
     }
 

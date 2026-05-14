@@ -328,7 +328,7 @@ export class Socket extends Duplex {
             readable: options?.readable ?? true,
             writable: options?.writable ?? true,
             // @ts-ignore
-            autoDestroy: false
+            autoDestroy: true
         });
 
         if (options?.socketDriver) {
@@ -428,12 +428,7 @@ export class Socket extends Duplex {
                     this._connected = false;
                     this.connecting = false;
                     this.push(null); // EOF
-                    if (!(this as any).allowHalfOpen && !this.writableEnded && !this.destroyed) {
-                        // Match Node's default behavior: half-close the writable side
-                        // when the peer finishes and allowHalfOpen is false.
-                        this.end();
-                    }
-                    this.emit('close', this._hadError);
+                    this.destroy();
                     break;
                 case NetSocketEvent.DRAIN:
                     this.emit('drain');
