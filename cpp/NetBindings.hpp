@@ -53,6 +53,9 @@ void net_init(CallbackPtr callback, void *context);
 /// otherwise the configuration will not take effect.
 void net_init_with_config(CallbackPtr callback, void *context, uint32_t worker_threads);
 
+/// Set the debug logging mode dynamically
+void net_set_debug(bool debug);
+
 uint32_t net_create_socket();
 
 void net_connect(uint32_t id, const char *host, int port);

@@ -125,6 +125,9 @@ public:
   void initWithConfig(const NetConfig &config) override {
     uint32_t workerThreads = config.workerThreads.value_or(0);
     NetManager::shared().initWithConfig(workerThreads);
+    if (config.debug.has_value()) {
+      net_set_debug(config.debug.value());
+    }
   }
 };
 
