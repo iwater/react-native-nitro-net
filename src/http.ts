@@ -3,11 +3,14 @@ import { EventEmitter } from 'eventemitter3'
 import { Buffer } from 'react-native-nitro-buffer'
 
 import { Driver } from './Driver'
-import { Socket } from './net'
+import { Socket, Server as NetServer, isIPv6 } from './net'
 import { TLSSocket } from './tls'
 import { debugLog as loggerDebugLog } from './Logger'
+// 全局 `URL` 的存在性守卫抽到 urlCompat.ts：http 与 https **两处**都要用
+// （只修 http 一侧时 `https.request({...})` 会以 `URL is not defined` 失败，实测过）。
+import { isURLLike, requireGlobalURL } from './urlCompat'
 
-function debugLog(message: string) {
+function debugLog(message: string | (() => string)) {
     loggerDebugLog('HTTP', message)
 }
 
@@ -80,6 +83,93 @@ export const METHODS = [
     'PURGE', 'PUT', 'REBIND', 'REPORT', 'SEARCH', 'SOURCE', 'SUBSCRIBE',
     'TRACE', 'UNBIND', 'UNLINK', 'UNLOCK', 'UNSUBSCRIBE'
 ];
+
+// ========== 注入校验（TS-M14） ==========
+//
+// 报文是**拼字符串**拼出来的（请求行/状态行 + 每行 `name: value`），因此任何含 CRLF
+// 的名字或取值都能凭空插入新的一行 —— 最典型的是
+// `res.setHeader('x', 'a\r\nSet-Cookie: evil=1')`，名字里塞 `\r\n` 更可以直接伪造
+// 后续整段报文（响应拆分 / 请求走私）。取值里混进裸 CR/LF 同样致命。
+//
+// 三个正则与错误码都对齐 Node：
+// - 名字必须是 RFC 9110 的 `token`（`ERR_INVALID_HTTP_TOKEN`）；
+// - 取值只允许 `\t` 与可见字符，含 0x80-0xff（`ERR_INVALID_CHAR`）；
+// - 请求行里的 path 只允许 `\u0021-\u00ff`，即空格与控制字符非法（`ERR_UNESCAPED_CHARACTERS`）。
+
+/** RFC 9110 `token`。 */
+const HTTP_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+/** 对齐 Node `checkInvalidHeaderChar`：除 `\t` 与可见字符外都非法（含 `\r`/`\n`）。 */
+const INVALID_HEADER_VALUE_RE = /[^\t\x20-\x7e\x80-\xff]/;
+/** 对齐 Node `checkInvalidPathChars`。 */
+const INVALID_PATH_CHAR_RE = /[^\u0021-\u00ff]/;
+
+function errWithCode(message: string, code: string): TypeError {
+    const err = new TypeError(message);
+    (err as any).code = code;
+    return err;
+}
+
+function validateHeaderName(name: string): void {
+    if (!HTTP_TOKEN_RE.test(name)) {
+        throw errWithCode(
+            `Header name must be a valid HTTP token ["${name}"]`,
+            'ERR_INVALID_HTTP_TOKEN'
+        );
+    }
+}
+
+function validateHeaderValue(name: string, value: string): void {
+    if (INVALID_HEADER_VALUE_RE.test(value)) {
+        throw errWithCode(`Invalid character in header content ["${name}"]`, 'ERR_INVALID_CHAR');
+    }
+}
+
+/** 响应状态行里的 status message。 */
+function validateStatusMessage(message: string): void {
+    if (INVALID_HEADER_VALUE_RE.test(message)) {
+        throw errWithCode('Invalid character in statusMessage', 'ERR_INVALID_CHAR');
+    }
+}
+
+/** 请求行的 path。 */
+function validateRequestPath(path: string): void {
+    if (INVALID_PATH_CHAR_RE.test(path)) {
+        throw errWithCode(
+            `Request path contains unescaped characters ["${path}"]`,
+            'ERR_UNESCAPED_CHARACTERS'
+        );
+    }
+}
+
+/** 请求行的 method（必须是 HTTP token，与 header 名同一字符集）。 */
+function validateRequestMethod(method: string): void {
+    if (!HTTP_TOKEN_RE.test(method)) {
+        throw errWithCode(
+            `Method must be a valid HTTP token ["${method}"]`,
+            'ERR_INVALID_HTTP_TOKEN'
+        );
+    }
+}
+
+/**
+ * RFC 9110 §7.8：升级请求必须**同时**带 `Upgrade` 头和 `Connection: upgrade`。
+ *
+ * Node v22.22.2 实测就是这个判定（缺任一个都走普通请求）：
+ *   Upgrade + Connection: Upgrade      → 'upgrade' 事件
+ *   Upgrade + Connection: keep-alive   → 普通请求
+ *   只有 Upgrade 头 / 只有 Connection  → 普通请求
+ *
+ * ⚠️ 必须与 rust 侧 `http_parser.rs::try_parse_request_headers` 的 `is_upgrade`
+ * 判定**保持一致**：那边靠这个标记决定是否把切分点之后的字节交出来当 head，
+ * 这边靠它决定走不走 upgrade 分支。两边判定不一致会出现「发了 upgrade 事件但
+ * head 是空的」。
+ */
+function isUpgradeRequest(headers: Record<string, any> | undefined | null): boolean {
+    if (!headers || !headers['upgrade']) return false;
+    const conn = headers['connection'];
+    const connStr = Array.isArray(conn) ? conn.join(',') : (typeof conn === 'string' ? conn : '');
+    return connStr.toLowerCase().includes('upgrade');
+}
 
 // ========== IncomingMessage ==========
 
@@ -164,6 +254,14 @@ export class OutgoingMessage extends Writable {
 
     setHeader(name: string, value: any): this {
         if (this.headersSent) throw new Error('Cannot set headers after they are sent');
+        // 注入校验放在这里：`_headers` 只由本方法写入，所以这是唯一的收口点
+        // （`_renderHeaders` 不需要再校验一遍）。数组值（如 Set-Cookie）逐项校验。
+        validateHeaderName(name);
+        if (Array.isArray(value)) {
+            for (const v of value) validateHeaderValue(name, String(v));
+        } else {
+            validateHeaderValue(name, String(value));
+        }
         const key = name.toLowerCase();
         this._headers[key] = value;
         this._headerNames[key] = name;
@@ -245,15 +343,35 @@ export class OutgoingMessage extends Writable {
         }
 
         if (this.chunkedEncoding) {
-            const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding as any) : chunk.length;
-            const header = len.toString(16) + '\r\n';
-            this.socket.write(Buffer.from(header));
-            // Note: We don't return the backpressure status here because we are doing multiple writes
-            // The final write determines the callback.
-            this.socket.write(chunk, encoding as any, (err) => {
-                if (err) return callback(err);
-                this.socket!.write(Buffer.from('\r\n'), undefined, callback);
-            });
+            // chunked 分帧原本要写三次：长度头 / 数据 / 结尾 CRLF。而**每次**
+            // `socket.write` 都是一次 JSI 往返 + 一次背压裁决（`Socket._write` 要等
+            // WRITTEN/BUSY 才 callback），于是每块 3 次往返（TS-L5）。
+            // 拼成一个 buffer 一次写出：**线字节与之前逐字节相同**
+            // （`len\r\n` + 数据 + `\r\n`），只是把三次往返合并成一次。
+            //
+            // 长度改由「转换后的字节」取而不是原来的 `Buffer.byteLength(chunk, encoding)`：
+            // 字符串按 encoding 转成 Buffer 后 `.length` 就是真实字节数，两者等价；
+            // 但对 **ArrayBuffer** 这类没有 `.length` 的入参，原写法会算出
+            // `undefined` 再 `.toString(16)` 抛错 —— 现在顺带修掉。
+            const data: Uint8Array = (chunk instanceof Uint8Array)
+                ? chunk
+                : Buffer.from(chunk, encoding as any);
+            // 零字节 chunk 在 chunked 流里**不产出任何线字节**。
+            // 照写会变成 `0\r\n` + 空 + `\r\n` = `0\r\n\r\n`，而这正是 chunked 的
+            // **结束块（terminator）**——写在响应中间会提前终结 body，后续块被对端
+            // 当成响应之后的垃圾字节（keep-alive 下更是直接错位）。
+            // 对齐 Node v22.22.2 实测：`write('A')→write('')→write(Buf0)→write('B')→end()`
+            // 的线字节是 `1\r\nA\r\n1\r\nB\r\n0\r\n\r\n`，空块零字节、结束块只在 end 出现一次。
+            //
+            // ⚠️ 但 **callback 必须照常触发**：上层 Writable 靠它推进内部缓冲与 drain，
+            // 漏调会让后续写卡死。所以这里是 `callback(); return;` 而不是直接 `return`。
+            if (data.length === 0) {
+                callback();
+                return;
+            }
+            const header = Buffer.from(data.length.toString(16) + '\r\n');
+            const tail = Buffer.from('\r\n');
+            this.socket.write(Buffer.concat([header, data, tail]), undefined, callback);
         } else {
             this.socket.write(chunk, encoding as any, callback);
         }
@@ -327,10 +445,18 @@ export class ServerResponse extends OutgoingMessage {
     public statusCode: number = 200;
     public statusMessage?: string;
     public socket: Socket;
+    /** 已写出的 body 字节数，用于校验 `Content-Length`（TS-M13）。 */
+    private _bodyBytesWritten: number = 0;
 
-    constructor(socket: Socket) {
+    constructor(socket: Socket, requestMethod: string = 'GET') {
         super();
         this.socket = socket;
+        // HEAD 响应不允许带 body（RFC 9110 §9.3.2），但解析器不知道请求方法 —— 只有 server
+        // 侧知道，所以由构造参数传进来。关掉 `_hasBody` 后：不会自动补
+        // Content-Length/Transfer-Encoding（与 Node 实测行为一致），写进来的 body 也会被丢弃。
+        if (String(requestMethod).toUpperCase() === 'HEAD') {
+            this._hasBody = false;
+        }
 
         const onClose = () => {
             if (this.socket) {
@@ -346,11 +472,17 @@ export class ServerResponse extends OutgoingMessage {
     writeHead(statusCode: number, statusMessage?: string | Record<string, any>, headers?: Record<string, any>): this {
         if (this.headersSent) throw new Error('Cannot write headers after they are sent');
         this.statusCode = statusCode;
+        this._applyNoBodyStatus();
         if (typeof statusMessage === 'object') {
             headers = statusMessage;
             statusMessage = undefined;
         }
-        if (statusMessage) this.statusMessage = statusMessage;
+        if (statusMessage) {
+            // 在调用点就抛（对齐 Node 的 writeHead），而不是等到真正发送时。
+            // `_sendResponseHeaders` 里还有一道兜底，覆盖 `res.statusMessage = '...'` 这种直接赋值。
+            validateStatusMessage(statusMessage);
+            this.statusMessage = statusMessage;
+        }
         if (headers) {
             for (const key in headers) {
                 this.setHeader(key, headers[key]);
@@ -361,15 +493,86 @@ export class ServerResponse extends OutgoingMessage {
         return this;
     }
 
+    /**
+     * 204/304/1xx（RFC 9110）不允许带 body：把 `_hasBody` 关掉，于是不会自动补
+     * Content-Length/Transfer-Encoding，写进来的 body 也会被丢弃。用户**显式**设过的
+     * Content-Length 保持原样（304 的 CL 描述的是被省略的表示，是合法用法；Node 亦然）。
+     */
+    private _applyNoBodyStatus(): void {
+        const status = this.statusCode;
+        if (status === 204 || status === 304 || (status >= 100 && status < 200)) {
+            this._hasBody = false;
+        }
+    }
+
+    /** 已声明的 `Content-Length`（没有或不是数字则为 null）。 */
+    private _declaredContentLength(): number | null {
+        const raw = this.getHeader('Content-Length');
+        if (raw === undefined || raw === null) return null;
+        const n = typeof raw === 'number' ? raw : parseInt(String(raw), 10);
+        return Number.isFinite(n) && n >= 0 ? n : null;
+    }
+
+    private _contentLengthMismatchError(declared: number, actual: number, kind: string): TypeError {
+        return errWithCode(
+            `Response body's length (${actual}) ${kind} the declared Content-Length (${declared}); ` +
+                `refusing to put a desynchronised body on the wire`,
+            'ERR_HTTP_CONTENT_LENGTH_MISMATCH'
+        );
+    }
+
     private _sendResponseHeaders() {
         if (this.headersSent) return;
-        const firstLine = `HTTP/1.1 ${this.statusCode} ${this.statusMessage || STATUS_CODES[this.statusCode] || 'OK'}`;
+        // 覆盖 `res.statusCode = 204` 这种绕过 writeHead 的直接赋值
+        this._applyNoBodyStatus();
+        // statusMessage 直接拼进状态行（且 `res.statusMessage = '...'` 可绕过 writeHead），
+        // 所以在这里收口校验，否则一样能注入出假的响应头（TS-M14）。
+        const statusMessage = this.statusMessage || STATUS_CODES[this.statusCode] || 'OK';
+        validateStatusMessage(statusMessage);
+        const firstLine = `HTTP/1.1 ${this.statusCode} ${statusMessage}`;
         this._sendHeaders(firstLine);
     }
 
     _write(chunk: any, encoding: string, callback: (error?: Error | null) => void) {
         if (!this.headersSent) this._sendResponseHeaders();
+
+        // HEAD / 204 / 304：body 一律丢弃、且不参与 Content-Length 校验（Node 同样静默丢弃）。
+        if (!this._hasBody) {
+            debugLog(`ServerResponse: dropping ${chunk?.length ?? 0} bytes of body (status=${this.statusCode}, no-body response)`);
+            callback();
+            return;
+        }
+
+        const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, encoding as any) : chunk.length;
+        const declared = this._declaredContentLength();
+        if (declared !== null && this._bodyBytesWritten + len > declared) {
+            // 多写的字节会被对端当成**下一个响应**的开头（keep-alive 下直接错位/走私）。
+            // Node 的 HTTP/1 默认会照发（实测如此），这里选择拒绝：已经发出去的部分无法撤回，
+            // 所以这条连接必须废弃，客户端会从截断的响应里发现异常。
+            const err = this._contentLengthMismatchError(
+                declared,
+                this._bodyBytesWritten + len,
+                'exceeds'
+            );
+            this.socket?.destroy();
+            callback(err);
+            return;
+        }
+        this._bodyBytesWritten += len;
+
         super._write(chunk, encoding, callback);
+    }
+
+    _final(callback: (error?: Error | null) => void) {
+        // 少写同样致命：声明了 N 字节却只发了 M<N，对端会一直等剩下的字节（连接挂死）。
+        const declared = this._hasBody && !this.chunkedEncoding ? this._declaredContentLength() : null;
+        if (declared !== null && this._bodyBytesWritten < declared) {
+            const err = this._contentLengthMismatchError(declared, this._bodyBytesWritten, 'is less than');
+            this.socket?.destroy();
+            callback(err);
+            return;
+        }
+        super._final(callback);
     }
 
     write(chunk: any, encoding?: any, callback?: any): boolean {
@@ -389,7 +592,12 @@ export class ServerResponse extends OutgoingMessage {
         if (!this.headersSent) {
             // If we have a single chunk and no headers sent yet, we can add Content-Length
             // to avoid chunked encoding for simple responses.
-            if (chunk != null) {
+            //
+            // 无 body 的响应（HEAD / 204 / 304）不补：Node 实测也不会自动补（用户显式设过的
+            // 则保留），补了反而会给对端一个"还有 N 字节"的错误信号。
+            if (!this._hasBody) {
+                debugLog(`ServerResponse.end: no-body response (status=${this.statusCode}), skipping Content-Length`);
+            } else if (chunk != null) {
                 const len = typeof chunk === 'string' ? Buffer.byteLength(chunk, (encoding as string) || undefined) : chunk.length;
                 this.setHeader('Content-Length', len);
             } else if (!this.hasHeader('Transfer-Encoding')) {
@@ -415,40 +623,37 @@ export interface ServerOptions {
     IncomingMessage?: typeof IncomingMessage;
     ServerResponse?: typeof ServerResponse;
     /**
-     * Keep-Alive header timeout in milliseconds.
+     * 空闲 keep-alive 超时（毫秒）：一次响应结束后连接回到空闲，超过这个时间没有下一条
+     * 请求就关闭它。
      */
     keepAliveTimeout?: number;
     /**
-     * Request timeout in milliseconds.
-     */
-    requestTimeout?: number;
-    /**
-     * Headers timeout in milliseconds.
+     * 等待请求头的超时（毫秒）：连接建立后、以及空闲连接上来新数据后开始计时，
+     * 超过这个时间还没收到完整请求头就断开。
      */
     headersTimeout?: number;
     /**
      * Max header size in bytes.
      */
     maxHeaderSize?: number;
-    /**
-     * If defined, sets the maximum number of requests socket can handle.
-     */
-    maxRequestsPerSocket?: number;
 }
 
 export class Server extends EventEmitter {
     protected _netServer: any;
     protected _httpConnections = new Set<Socket>();
     public maxHeaderSize: number = 16384;
-    public maxRequestsPerSocket: number = 0;
     public headersTimeout: number = 60000;
-    public requestTimeout: number = 300000;
     public keepAliveTimeout: number = 5000;
+    // 注：原先这里还有 requestTimeout / maxRequestsPerSocket 两个字段（以及同名 option），
+    // 但它们从未被任何代码读过 —— 只是"看起来支持"。Task 26 删掉，避免误以为已经生效。
+    // （Node 有这两个概念；将来要实现 requestTimeout 应覆盖"从收到请求到读完 body"这段。）
 
     constructor(options?: ServerOptions | ((req: IncomingMessage, res: ServerResponse) => void), requestListener?: (req: IncomingMessage, res: ServerResponse) => void) {
         super();
-        // Use net.Server from index.ts
-        const { Server: NetServer } = require('./net');
+        // net.Server 走**顶层 import**（见文件头），不再用函数内 `require('./net')`：
+        // 那条惰性 require 在 ESM-only 宿主（全局无 `require`，如无头 JS 宿主）
+        // 里会让 http.createServer() 一调就 ReferenceError。net.ts 不 import http.ts，
+        // 循环依赖不存在；顶层 import 对 RN 无行为差异（tls.ts 早就这么写了）。
         this._netServer = new NetServer();
 
         let listener: ((req: IncomingMessage, res: ServerResponse) => void) | undefined;
@@ -456,10 +661,8 @@ export class Server extends EventEmitter {
             listener = options;
         } else if (options) {
             if (options.keepAliveTimeout !== undefined) this.keepAliveTimeout = options.keepAliveTimeout;
-            if (options.requestTimeout !== undefined) this.requestTimeout = options.requestTimeout;
             if (options.headersTimeout !== undefined) this.headersTimeout = options.headersTimeout;
             if (options.maxHeaderSize !== undefined) this.maxHeaderSize = options.maxHeaderSize;
-            if (options.maxRequestsPerSocket !== undefined) this.maxRequestsPerSocket = options.maxRequestsPerSocket;
             listener = requestListener;
         }
 
@@ -471,6 +674,9 @@ export class Server extends EventEmitter {
         this._netServer.on('listening', () => this.emit('listening'));
         this._netServer.on('close', () => this.emit('close'));
         this._netServer.on('error', (err: any) => this.emit('error', err));
+        // setTimeout() 会把回调挂到 netServer 的 'timeout' 事件上；这里转发给 http.Server，
+        // 否则 `server.setTimeout(ms, cb)` 传入的 cb 永远不会被调用（TS-H7 修复的一部分）
+        this._netServer.on('timeout', (socket: any) => this.emit('timeout', socket));
 
         this._netServer.on('connection', (socket: Socket) => {
             this._setupHttpConnection(socket);
@@ -487,20 +693,54 @@ export class Server extends EventEmitter {
         // @ts-ignore
         let contentLength = -1;
 
-        // headersTimeout logic
+        // ---- 连接级超时（R-M7 / TS-M19）----
+        //
+        // 以前这里只在**建连接时**武装一次 headersTimeout，首个请求头到达就清除、之后再无
+        // 计时 —— keep-alive 上的后续请求与空闲连接完全没有保护（TS-M19）。
+        // 现在按 Node 的语义分成两个互斥的空闲计时器：
+        //   - headersTimer：等请求头（连接刚建立、或空闲后新数据到来）；
+        //   - keepAliveTimer：一次响应已结束、连接空闲、等下一条请求。
+        // 任何新的入站数据都会把状态切回"等请求头"。
         let headersTimer: any = null;
-        if (this.headersTimeout > 0) {
-            headersTimer = setTimeout(() => {
-                debugLog(`Server: headersTimeout reached for socket, destroying`);
-                socket.destroy();
-            }, this.headersTimeout);
-        }
+        let keepAliveTimer: any = null;
+
+        const clearTimers = () => {
+            if (headersTimer) { clearTimeout(headersTimer); headersTimer = null; }
+            if (keepAliveTimer) { clearTimeout(keepAliveTimer); keepAliveTimer = null; }
+        };
+
+        /** 等请求头；超时即断开（半开的连接不能一直占着）。 */
+        const armHeadersTimer = () => {
+            clearTimers();
+            if (this.headersTimeout > 0) {
+                headersTimer = setTimeout(() => {
+                    debugLog(`Server: headersTimeout (${this.headersTimeout}ms) reached, destroying connection`);
+                    socket.destroy();
+                }, this.headersTimeout);
+            }
+        };
+
+        /** 连接空闲、等下一条请求；超时即回收（"空闲回池/关闭"）。 */
+        const armKeepAliveTimer = () => {
+            clearTimers();
+            if (this.keepAliveTimeout > 0) {
+                keepAliveTimer = setTimeout(() => {
+                    debugLog(`Server: keepAliveTimeout (${this.keepAliveTimeout}ms) reached, closing idle connection`);
+                    socket.destroy();
+                }, this.keepAliveTimeout);
+            }
+        };
+
+        armHeadersTimer();
 
         const onData = (data: Buffer) => {
+            // 空闲连接上来了数据（下一条请求）→ 从"空闲"切回"等请求头"
+            if (keepAliveTimer) armHeadersTimer();
+
             const handleParsedResult = (result: any) => {
                 const metadata = result.metadata;
                 if (metadata.startsWith('ERROR:')) {
-                    if (headersTimer) clearTimeout(headersTimer);
+                    clearTimers();
                     this.emit('error', new Error(metadata));
                     socket.destroy();
                     return;
@@ -511,10 +751,9 @@ export class Server extends EventEmitter {
                 }
 
                 if (parsed.is_headers) {
-                    if (headersTimer) {
-                        clearTimeout(headersTimer);
-                        headersTimer = null;
-                    }
+                    // 请求头到齐：两个空闲计时器都不再适用（响应期间的保护是 requestTimeout
+                    // 的职责，本库尚未实现，见 Server 类上的注释）。
+                    clearTimers();
 
                     // Handle CONNECT method (HTTP Tunneling)
                     if (parsed.is_connect) {
@@ -530,8 +769,12 @@ export class Server extends EventEmitter {
 
                         debugLog(`Server: CONNECT request received, emitting 'connect' event`);
 
-                        // TODO: retrieve any remaining body from parser as 'head'
-                        const head = Buffer.alloc(0);
+                        // 切分点之后的字节由解析器经 `body` 通道带出来（见
+                        // `http_parser.rs::try_parse_request_headers`）：CONNECT 之后是
+                        // 不透明隧道流，那批字节在 Node 里就是 `'connect'` 的 head 参数。
+                        // 客户端把隧道协议的初始字节与 CONNECT 请求打进**同一个 TCP 包**
+                        // 时，没有它用户就永远拿不到（此前恒为空 Buffer，R5）。
+                        const head = parsed.body ?? Buffer.alloc(0);
 
                         if (this.listenerCount('connect') > 0) {
                             this.emit('connect', req, socket, head);
@@ -549,20 +792,26 @@ export class Server extends EventEmitter {
                     currentReq.headers = parsed.headers;
                     req = currentReq;
 
-                    const currentRes = new ServerResponse(socket);
+                    const currentRes = new ServerResponse(socket, parsed.method ?? 'GET');
                     res = currentRes;
 
                     // Support Keep-Alive: reset state once response is done
                     currentRes.on('finish', () => {
                         req = null;
                         res = null;
+                        // 响应结束、连接回到空闲：起 keepAliveTimeout，闲置太久就回收
+                        // （若响应本身要求关连接，socket 随后会被销毁，这个计时器随 'close' 清掉）
+                        if (!socket.destroyed) armKeepAliveTimer();
                         // The parser should already be reset in Rust
                     });
 
-                    const upgrade = req.headers['upgrade'];
-                    if (upgrade && this.listenerCount('upgrade') > 0) {
+                    if (isUpgradeRequest(req.headers) && this.listenerCount('upgrade') > 0) {
                         debugLog(`Server: Upgrade request received, emitting 'upgrade' event`);
-                        this.emit('upgrade', req, socket, Buffer.alloc(0));
+                        // 与 CONNECT 同理（R7）：升级请求之后连接被交出去、后面是不透明
+                        // 字节流，切分点之后的字节由 parser 经 `body` 通道带出来，在 Node
+                        // 里就是 `'upgrade'` 的 head 参数（此前恒为空 Buffer）。
+                        const head = parsed.body ?? Buffer.alloc(0);
+                        this.emit('upgrade', req, socket, head);
                         return;
                     }
 
@@ -590,14 +839,21 @@ export class Server extends EventEmitter {
                 // socket data events will arrive, the flow() loop never drains it.
                 // Solution: always defer body/EOF push via process.nextTick so the
                 // Readable has a chance to enter flowing mode first.
-                const _bodyToPush = req && parsed.body && parsed.body.length > 0
+                // 带 `Upgrade` 头但**没有** upgrade 监听器时（Node 也是走普通请求）：
+                // headers 消息里那批字节是**隧道流的开头**，不是本请求的 body → 丢弃，
+                // 不能 push 进 IncomingMessage（会被误当成请求体）。
+                // 只在 headers 消息上判定：带 Content-Length 的升级请求走的是 body 消息
+                // （is_headers=false），那里的字节是**真 body**，必须照常 push。
+                const _upgradeHeadDropped = !!(parsed.is_headers && req && isUpgradeRequest(req.headers));
+                const _bodyToPush = req && !_upgradeHeadDropped && parsed.body && parsed.body.length > 0
                     ? Buffer.from(parsed.body) : null;
                 const _isComplete = !!(req && parsed.complete);
                 const _trailers = parsed.trailers;
                 const _reqRef = req;
 
                 // Diagnostic: log body delivery state (requires debug mode)
-                debugLog(`[Server] handleParsedResult: is_headers=${parsed.is_headers}, ` +
+                // 每个数据包都会走到这里 → thunk，避免 verbose 关闭时白拼 3 段字符串
+                debugLog(() => `[Server] handleParsedResult: is_headers=${parsed.is_headers}, ` +
                     `bodyLen=${_bodyToPush?.length ?? 0}, complete=${_isComplete}, ` +
                     `req.readableFlowing=${(_reqRef as any)?._readableState?.flowing}`);
 
@@ -607,7 +863,7 @@ export class Server extends EventEmitter {
                         debugLog(`[Server] Deferring body/EOF push via setImmediate (same-packet)`);
                         setImmediate(() => {
                             if (!_reqRef) return;
-                            debugLog(`[Server] setImmediate: pushing body=${_bodyToPush?.length ?? 0}, EOF=${_isComplete}`);
+                            debugLog(() => `[Server] setImmediate: pushing body=${_bodyToPush?.length ?? 0}, EOF=${_isComplete}`);
                             if (_bodyToPush) _reqRef.push(_bodyToPush);
                             if (_isComplete) {
                                 _reqRef.complete = true;
@@ -640,11 +896,16 @@ export class Server extends EventEmitter {
                 iterations++;
                 const result = parser.feed(input);
                 const metadata = result.metadata;
-                if (!metadata || metadata === '' || metadata.startsWith('ERROR:')) {
-                    // Empty result (partial) or error - exit loop
-                    if (metadata && metadata.startsWith('ERROR:')) {
-                        debugLog(`[HTTP] Server: Parser error: ${metadata}`);
-                    }
+                if (!metadata || metadata === '') {
+                    // 空 metadata = 数据不足，等下一包
+                    break;
+                }
+                if (metadata.startsWith('ERROR:')) {
+                    // 解析失败：交给 handleParsedResult 的错误分支（emit error + destroy socket）。
+                    // 此前这里直接 break，于是坏数据留在 Rust 侧缓冲里反复失败、连接既不报错
+                    // 也不断开（TS-H6）。
+                    debugLog(`[HTTP] Server: Parser error: ${metadata}`);
+                    handleParsedResult(result);
                     break;
                 }
                 handleParsedResult(result);
@@ -657,7 +918,7 @@ export class Server extends EventEmitter {
         socket.resume();
 
         socket.on('close', () => {
-            if (headersTimer) clearTimeout(headersTimer);
+            clearTimers();
             this._httpConnections.delete(socket);
             if (req && !req.readableEnded) {
                 req.push(null);
@@ -796,11 +1057,19 @@ export class Agent extends EventEmitter {
 
             if (this.freeSockets[name].length === 0) delete this.freeSockets[name];
 
+            // 取出即取消空闲销毁定时器（回池时设的，见 releaseSocket）
+            if ((socket as any)._agentIdleTimer) {
+                clearTimeout((socket as any)._agentIdleTimer);
+                delete (socket as any)._agentIdleTimer;
+            }
+
             // Re-use socket
             if (!this.sockets[name]) this.sockets[name] = [];
             this.sockets[name].push(socket);
 
-            req.onSocket(socket);
+            // 必须走 reuseSocket()：它会先摘掉 releaseSocket 留下的 _agentOnClose 监听。
+            // 否则那条陈旧监听会在 socket 之后关闭时再 _removeSocket 一次，把计数改坏（TS-M2）。
+            this.reuseSocket(socket, req);
             return;
         }
 
@@ -868,9 +1137,15 @@ export class Agent extends EventEmitter {
         }
 
         socket.on('error', (err) => {
-            if (called) return;
-            called = true;
             debugLog(`Agent.createConnection: socket ERROR for ${name}: ${err.message}`);
+            if (called) {
+                // 连接已经成功过、socket 已交给请求：仍必须把它的池位还回去 ——
+                // 否则这些 socket 会永久占着 maxSockets 名额，之后所有请求都只能排在
+                // requests 队列里（TS-M1）。_removeSocket 幂等，重复调用不会多减。
+                this._removeSocket(socket, name);
+                return;
+            }
+            called = true;
             this._totalSockets--;
             if (this.sockets[name]) {
                 const idx = this.sockets[name].indexOf(socket);
@@ -889,6 +1164,13 @@ export class Agent extends EventEmitter {
 
     public releaseSocket(socket: Socket, options: RequestOptions) {
         const name = this.getName(options);
+
+        // 防御：若这条 socket 还挂着空闲销毁定时器（理论上取出时已清），先清掉，
+        // 否则定时器晚到会去销毁一条已经在用的 socket。
+        if ((socket as any)._agentIdleTimer) {
+            clearTimeout((socket as any)._agentIdleTimer);
+            delete (socket as any)._agentIdleTimer;
+        }
 
         // Remove from active sockets
         if (this.sockets[name]) {
@@ -920,6 +1202,15 @@ export class Agent extends EventEmitter {
             // Return to free pool
             if (!this.freeSockets[name]) this.freeSockets[name] = [];
             if (this.freeSockets[name].length < this.maxFreeSockets) {
+                // 空闲超时：keepAliveMsecs 内没被复用就销毁并归还池位（TS-M3）。
+                // 注：Node 里 keepAliveMsecs 本是 TCP keep-alive 探测间隔，这里按计划
+                // 兼作空闲上限。默认 1s 偏保守 —— 池化收益变小，但不会长期占着空闲 fd。
+                const idleTimer = setTimeout(() => {
+                    delete (socket as any)._agentIdleTimer;
+                    this._removeSocket(socket, name);
+                    socket.destroy();
+                }, this.keepAliveMsecs);
+                (socket as any)._agentIdleTimer = idleTimer;
                 this.freeSockets[name].push(socket);
             } else {
                 this._totalSockets--;
@@ -944,6 +1235,16 @@ export class Agent extends EventEmitter {
             delete (socket as any)._agentOnClose;
         }
         req.onSocket(socket);
+    }
+
+    /**
+     * 把一条已经断开的 socket 从池子里摘除并归还池位计数（幂等）。
+     *
+     * ClientRequest 在 error/close 路径上调用它（TS-M1）。不做的话 sockets[name] 会
+     * 永久残留、_totalSockets 只增不减，一旦触顶所有新请求都只能排队。
+     */
+    public removeSocket(socket: Socket, options: RequestOptions): void {
+        this._removeSocket(socket, this.getName(options));
     }
 
     private _removeSocket(socket: Socket, name: string) {
@@ -1037,6 +1338,17 @@ export class ClientRequest extends OutgoingMessage {
         this.path = options.path || '/';
         this.host = options.hostname || options.host || 'localhost';
 
+        // 请求行的校验放在**构造期**（= http.request() 的调用点），对齐 Node。
+        // 实测 Node v22：`http.request({ path: '/a b' })` 同步抛
+        // `TypeError [ERR_UNESCAPED_CHARACTERS]`（不是异步 error 事件）。
+        // 旧实现只在 `_sendRequest`（连上之后）校验，于是同一个错误在
+        // ESM/原生宿主里表现为「从原生回调里抛出」——异常会穿过 native→JS 边界
+        // 直接终止进程（无头宿主上实测 exit 134，`std::terminate`），
+        // 用户既 catch 不到也拿不到 error 事件。`_sendRequest` 里那一道**保留**
+        // 作纵深防御（覆盖构造后被直接改 `req.path` 的情况）。
+        validateRequestMethod(this.method);
+        validateRequestPath(this.path);
+
         if (['GET', 'HEAD'].includes(this.method.toUpperCase())) {
             this._hasBody = false;
         }
@@ -1117,6 +1429,27 @@ export class ClientRequest extends OutgoingMessage {
         const parser = Driver.createHttpParser(1); // 1 = Response mode
 
         const onData = (data: Buffer) => {
+            // 101 / CONNECT 2xx 之后连接被交出去，后面是不透明字节流。同一 TCP 包里
+            // 跟在响应头后面的那批字节，parser 会按「indefinite body」以**后续 body
+            // 消息**的形式吐出来（这类响应没有 Content-Length → expected_body_len =
+            // None，见 http_parser.rs::try_parse_body）—— 也就是说字节**已经在通道里**，
+            // 只是没人接。在 Node 里它就是 'upgrade' / 'connect' 的 head 参数（R7）。
+            //
+            // ⚠️ 只能在这两种情形下抽：普通响应后面的字节是真 body，抽了就没了。
+            const drainTunnelHead = (): Buffer => {
+                const chunks: Buffer[] = [];
+                for (let i = 0; i < 2000; i++) { // 上限，防御 parser 异常自激
+                    const r = parser.feed(new ArrayBuffer(0));
+                    const md = r.metadata;
+                    if (!md || md === '') break;        // 没有更多消息
+                    if (md.startsWith('ERROR:')) break; // 解析失败：不吞，留给外层处理
+                    const p = JSON.parse(md);
+                    if (r.body && r.body.byteLength > 0) chunks.push(Buffer.from(r.body));
+                    if (p.is_headers) break;            // 隧道里不该再出现 HTTP 报文头
+                }
+                return chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0);
+            };
+
             const handleParsedResult = (result: any) => {
                 const metadata = result.metadata;
                 if (metadata.startsWith('ERROR:')) {
@@ -1128,7 +1461,8 @@ export class ClientRequest extends OutgoingMessage {
                 if (result.body) {
                     parsed.body = Buffer.from(result.body);
                 }
-                debugLog(`[HTTP] _connect: Parser result: ${parsed.is_headers ? 'HEADERS' : 'DATA'}${parsed.complete ? ' (COMPLETE)' : ''}`);
+                // 每个数据包一条 → thunk
+                debugLog(() => `[HTTP] _connect: Parser result: ${parsed.is_headers ? 'HEADERS' : 'DATA'}${parsed.complete ? ' (COMPLETE)' : ''}`);
 
                 if (parsed.is_headers) {
                     const status = parsed.status || 0;
@@ -1161,7 +1495,7 @@ export class ClientRequest extends OutgoingMessage {
                         debugLog(`ClientRequest: 101 Switching Protocols received, detaching parser`);
                         this.socket!.removeListener('data', onData);
                         this.socket!.removeListener('error', onError);
-                        this.emit('upgrade', this._res, this.socket!, Buffer.alloc(0));
+                        this.emit('upgrade', this._res, this.socket!, drainTunnelHead());
                         return;
                     }
 
@@ -1170,11 +1504,26 @@ export class ClientRequest extends OutgoingMessage {
                         debugLog(`ClientRequest: CONNECT tunnel established (status=${status}), emitting 'connect' event`);
                         this.socket!.removeListener('data', onData);
                         this.socket!.removeListener('error', onError);
-                        this.emit('connect', this._res, this.socket!, Buffer.alloc(0));
+                        this.emit('connect', this._res, this.socket!, drainTunnelHead());
                         return;
                     }
 
                     this.emit('response', this._res);
+
+                    // HEAD 响应没有 body（RFC 9110），但解析器**不知道请求方法** —— 只有这里知道。
+                    // 服务器通常仍会带上 Content-Length/Transfer-Encoding（描述的是"本应发送"的
+                    // 表示），解析器于是会一直等一个永不到来的 body：响应既不 complete 也不 close，
+                    // 请求永久悬挂（R-M8）。这里按方法直接收尾。
+                    //
+                    // 204/304 由解析器按状态码处理（不需要方法，见 http_parser.rs）；
+                    // 1xx 在上面就 return 了。这里只管 HEAD。
+                    //
+                    // 不需要复位解析器：它是**每个请求**新建的（见 _attachSocketListeners），
+                    // 这个请求结束后会被丢弃，残留状态不会带到下一个请求。
+                    if (this.method.toUpperCase() === 'HEAD') {
+                        debugLog(`[HTTP] ClientRequest: HEAD response ends at headers (status=${status})`);
+                        parsed.complete = true;
+                    }
                 }
 
                 if (this._res && parsed.body && parsed.body.length > 0) {
@@ -1198,11 +1547,15 @@ export class ClientRequest extends OutgoingMessage {
                 iterations++;
                 const result = parser.feed(input);
                 const metadata = result.metadata;
-                if (!metadata || metadata === '' || metadata.startsWith('ERROR:')) {
-                    // Empty result (partial) or error - exit loop
-                    if (metadata && metadata.startsWith('ERROR:')) {
-                        debugLog(`[HTTP] ClientRequest: Parser error: ${metadata}`);
-                    }
+                if (!metadata || metadata === '') {
+                    // 空 metadata = 数据不足，等下一包
+                    break;
+                }
+                if (metadata.startsWith('ERROR:')) {
+                    // 解析失败：交给 handleParsedResult 的错误分支（emit error + destroy socket），
+                    // 不再静默 break（TS-H6）
+                    debugLog(`[HTTP] ClientRequest: Parser error: ${metadata}`);
+                    handleParsedResult(result);
                     break;
                 }
                 handleParsedResult(result);
@@ -1213,6 +1566,7 @@ export class ClientRequest extends OutgoingMessage {
         const onError = (err: Error) => {
             debugLog(`[HTTP] _connect: Socket error: ${err.message}`);
             this.emit('error', err);
+            this._discardSocket();
             this._cleanupSocket();
         };
 
@@ -1220,6 +1574,7 @@ export class ClientRequest extends OutgoingMessage {
             debugLog(`[HTTP] _connect: Socket closed`);
             if (this._res && !this._res.readableEnded) this._res.push(null);
             this.emit('close');
+            this._discardSocket();
             this._cleanupSocket();
         };
 
@@ -1235,6 +1590,26 @@ export class ClientRequest extends OutgoingMessage {
     }
 
     private _socketCleanup?: () => void;
+
+    /** 取得本次请求实际使用的 agent（与 _finishResponse 的选择逻辑保持一致）。 */
+    private _getAgent(): Agent {
+        return this._options.agent === false
+            ? new Agent()
+            : (this._options.agent instanceof Agent ? this._options.agent : globalAgent);
+    }
+
+    /**
+     * 连接以失败/异常方式结束：把 socket 从 agent 池子里摘除并归还池位计数。
+     *
+     * 不做的后果：`sockets[name]` 永久残留、`_totalSockets` 只增不减 —— 一旦达到
+     * `maxSockets`/`maxTotalSockets`，之后所有请求都会永远排在 `requests` 队列里（TS-M1）。
+     */
+    private _discardSocket() {
+        const socket = this.socket;
+        if (!socket) return;
+        this._getAgent().removeSocket(socket, this._options);
+    }
+
     private _cleanupSocket() {
         if (this._socketCleanup) this._socketCleanup();
         this._socketCleanup = undefined;
@@ -1243,11 +1618,35 @@ export class ClientRequest extends OutgoingMessage {
     }
 
     private _finishResponse() {
-        // Release socket back to agent
-        const agent = this._options.agent === false ? new Agent() : (this._options.agent instanceof Agent ? this._options.agent : globalAgent);
+        const agent = this._getAgent();
         const socket = this.socket;
+
+        // 服务端在响应头里声明了 Connection: close（解析器把 header 名转成小写），
+        // 这条连接不能回池复用，否则下次请求会写到一个已经要关闭的 socket 上（TS-M3）。
+        const connHeader = this._res?.headers?.['connection'];
+        const connValue = Array.isArray(connHeader) ? connHeader.join(',') : connHeader;
+        const connLower = typeof connValue === 'string' ? connValue.toLowerCase() : '';
+        const explicitClose = connLower.includes('close');
+        const explicitKeepAlive = connLower.includes('keep-alive');
+
+        // HTTP/1.0 的**默认**语义是非 keep-alive：只有显式带 `Connection: keep-alive`
+        // 才能复用（RFC 9112 §19.7.1；并对齐 Node v22.22.2 实测：1.0 无 Connection
+        // → 新连接；1.0 + keep-alive → 复用）。
+        // 少了这条，Agent 会把一条服务端随时会按 1.0 语义关掉的连接发还复用，
+        // 下一次请求就写进死连接（Task 15 边界① / R3）。
+        const isHttp10 = this._res?.httpVersion === '1.0';
+
+        const serverWantsClose = explicitClose || (isHttp10 && !explicitKeepAlive);
+
         this._cleanupSocket();
-        if (socket) agent.releaseSocket(socket, this._options);
+        if (socket) {
+            if (serverWantsClose) {
+                agent.removeSocket(socket, this._options); // 归还池位
+                socket.destroy();
+            } else {
+                agent.releaseSocket(socket, this._options);
+            }
+        }
         this.emit('close');
     }
 
@@ -1311,13 +1710,37 @@ export class ClientRequest extends OutgoingMessage {
         }
     }
 
+    /**
+     * Host 头对齐 Node（期望值来自 node -e 实测）：
+     *   非默认端口要带上 —— `{hostname:'example.com', port:8080}` → `example.com:8080`
+     *   默认端口不带     —— http 的 80 / https 的 443 → `example.com`
+     *   IPv6 加方括号   —— `{hostname:'::1', port:8080}` → `[::1]:8080`
+     * 之前恒为 `this.host`（丢端口），非 80/443 端口上发的 Host 是错的。
+     */
+    private _hostHeader(): string {
+        const hostname = this.host;
+        const needsBrackets = hostname.includes(':') && isIPv6(hostname) && !hostname.startsWith('[');
+        let hostHeader = needsBrackets ? `[${hostname}]` : hostname;
+        const defaultPort = this._options.protocol === 'https:' ? 443 : 80;
+        const port = this._options.port;
+        if (port !== undefined && port !== null && Number(port) !== defaultPort) {
+            hostHeader += `:${port}`;
+        }
+        return hostHeader;
+    }
+
     private _sendRequest() {
         debugLog(`ClientRequest._sendRequest: headersSent=${this.headersSent}, socket=${!!this.socket}`);
         if (this.headersSent) return;
 
         if (!this.hasHeader('host')) {
-            this.setHeader('Host', this.host);
+            this.setHeader('Host', this._hostHeader());
         }
+
+        // 请求行同样是拼出来的：method 与 path 里若带空格/控制字符（尤其是 CRLF），
+        // 可以直接改写这一行的结构、甚至插入整段伪造报文（TS-M14）。
+        validateRequestMethod(this.method);
+        validateRequestPath(this.path);
 
         const firstLine = `${this.method} ${this.path} HTTP/1.1`;
         debugLog(`ClientRequest._sendRequest: sending firstLine=${firstLine}`);
@@ -1414,14 +1837,15 @@ export function request(
     let cb: ((res: IncomingMessage) => void) | undefined = callback;
 
     if (typeof urlOrOptions === 'string') {
-        const url = new URL(urlOrOptions);
+        const URLCtor = requireGlobalURL('http.request()');
+        const url = new URLCtor(urlOrOptions);
         opts = {
             protocol: url.protocol,
             hostname: url.hostname,
             path: url.pathname + url.search,
             port: url.port ? parseInt(url.port) : undefined
         };
-    } else if (urlOrOptions instanceof URL) {
+    } else if (isURLLike(urlOrOptions)) {
         opts = {
             protocol: urlOrOptions.protocol,
             hostname: urlOrOptions.hostname,

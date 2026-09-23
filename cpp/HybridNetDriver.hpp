@@ -10,6 +10,7 @@
 #include <jsi/jsi.h>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace margelo {
 namespace nitro {
@@ -41,11 +42,22 @@ public:
   createSocket(const std::optional<std::string> &id) override {
     if (id.has_value()) {
       // Existing socket from server accept
+      // 解析失败不能静默新建一个空 socket：调用方拿到的对象 id 与请求的
+      // 对不上，事件会挂在没有任何人监听的新 socket 上，表现是"连上了但永远
+      // 收不到数据"。报出来。
+      // （Nitro 的 HybridFunction 会把 std::exception 转成 JS Error，
+      //  见 nitro/core/HybridFunction.hpp 的 catch(const std::exception&)。）
       try {
-        uint32_t socketId = static_cast<uint32_t>(std::stoul(id.value()));
-        return std::make_shared<HybridNetSocketDriver>(socketId);
-      } catch (...) {
-        return std::make_shared<HybridNetSocketDriver>();
+        std::size_t parsed = 0;
+        unsigned long long socketId = std::stoull(id.value(), &parsed);
+        if (parsed != id.value().size() || socketId > 0xFFFFFFFFull) {
+          throw std::invalid_argument("socket id out of range or trailing garbage");
+        }
+        return std::make_shared<HybridNetSocketDriver>(
+            static_cast<uint32_t>(socketId));
+      } catch (const std::exception &e) {
+        throw std::invalid_argument(
+            "createSocket: invalid socket id \"" + id.value() + "\" (" + e.what() + ")");
       }
     }
     return std::make_shared<HybridNetSocketDriver>();
@@ -131,12 +143,16 @@ public:
   }
 
   std::string getNetworkInterfaces() override {
-    char buf[32768];
-    size_t len = ::net_get_interfaces(buf, sizeof(buf));
-    if (len > 0) {
-      return std::string(buf, len);
-    }
-    return "{}";
+    // 两次调用：先只查长度，再按长度精确分配；定长栈缓冲区会在接口 JSON
+    // 超过缓冲区时被越界读取（Rust 侧不足时不拷贝但仍返回真实长度）
+    size_t len = ::net_get_interfaces(nullptr, 0);
+    if (len == 0)
+      return "{}";
+    std::vector<char> buf(len + 1); // 多留 1 字节供 Rust 写 NUL 终止符
+    size_t got = ::net_get_interfaces(buf.data(), buf.size());
+    if (got == 0 || got > len)
+      return "{}";
+    return std::string(buf.data(), got);
   }
 };
 

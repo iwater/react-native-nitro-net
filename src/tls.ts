@@ -3,7 +3,7 @@ import { Driver } from './Driver'
 import { NetSocketDriver } from './Net.nitro'
 import { debugLog as loggerDebugLog } from './Logger'
 
-function debugLog(message: string) {
+function debugLog(message: string | (() => string)) {
     loggerDebugLog('TLS', message)
 }
 
@@ -115,28 +115,37 @@ export class TLSSocket extends Socket {
         return this._servername
     }
 
+    /**
+     * `_driver` 在 `_destroy()` 里被清空。destroy 之后这些 getter 原来是
+     * `undefined.getXXX()` → TypeError（实测 Node 同期返回空值，不抛）。
+     */
+    private get _tls(): NetSocketDriver | undefined {
+        return (this as any)._driver as NetSocketDriver | undefined
+    }
+
     get authorized(): boolean {
-        const driver = (this as any)._driver as NetSocketDriver
-        return driver.getAuthorizationError() === undefined
+        const driver = this._tls
+        return driver ? driver.getAuthorizationError() === undefined : false
     }
 
     get authorizationError(): string | undefined {
-        const driver = (this as any)._driver as NetSocketDriver
-        return driver.getAuthorizationError()
+        const driver = this._tls
+        return driver ? driver.getAuthorizationError() : undefined
     }
 
     get alpnProtocol(): string | undefined {
-        const driver = (this as any)._driver as NetSocketDriver
-        return driver.getALPN()
+        const driver = this._tls
+        return driver ? driver.getALPN() : undefined
     }
 
     getProtocol(): string | undefined {
-        const driver = (this as any)._driver as NetSocketDriver
-        return driver.getProtocol()
+        const driver = this._tls
+        return driver ? driver.getProtocol() : undefined
     }
 
     getCipher(): { name: string, version: string } | undefined {
-        const driver = (this as any)._driver as NetSocketDriver
+        const driver = this._tls
+        if (!driver) return undefined
         const cipher = driver.getCipher()
         const protocol = driver.getProtocol()
         if (cipher) {
@@ -149,7 +158,8 @@ export class TLSSocket extends Socket {
     }
 
     getPeerCertificate(detailed?: boolean): PeerCertificate | {} {
-        const driver = (this as any)._driver as NetSocketDriver
+        const driver = this._tls
+        if (!driver) return {}
         const json = driver.getPeerCertificateJSON()
         if (json) {
             try {
@@ -263,9 +273,21 @@ export class TLSSocket extends Socket {
     }
 
     override connect(options: any, connectionListener?: () => void): this {
-        // Override connect to use connectTLS
+        // 数字签名 `connect(port[, host][, cb])` 下 host 在 arguments[1]。
+        // 原来只认 `typeof options === 'string'`，于是 `connect(443, 'example.com')`
+        // 的 host 静默落到 'localhost'（连错地方，且 SNI 也跟着错）。
         const port = typeof options === 'number' ? options : options.port
-        const host = (typeof options === 'object' && options.host) ? options.host : (typeof options === 'string' ? arguments[1] : 'localhost')
+        const host = (typeof options === 'object' && options.host)
+            ? options.host
+            : ((typeof options === 'string' || typeof options === 'number') && typeof arguments[1] === 'string')
+                ? arguments[1]
+                : 'localhost'
+        // 回调位置随参数个数变化（同 net.ts，形参 connectionListener === arguments[1]）：
+        //   (port, cb) → arguments[1]；(port, host, cb) → arguments[2]；(port, host) → 无回调。
+        // 直接用形参会在 `(port, host)` 下把 host 字符串当监听函数注册 → TypeError。
+        const listener: (() => void) | undefined = typeof arguments[1] === 'function'
+            ? arguments[1]
+            : (typeof arguments[2] === 'function' ? arguments[2] : undefined)
         const path = (typeof options === 'object' && options.path) ? options.path : undefined
         const servername = (typeof options === 'object' && options.servername) ? options.servername : (path ? 'localhost' : host)
         this._servername = servername
@@ -276,7 +298,7 @@ export class TLSSocket extends Socket {
 
         if (driver) {
             this.connecting = true;
-            if (connectionListener) this.once('secureConnect', connectionListener);
+            if (listener) this.once('secureConnect', listener);
 
             this.once('connect', () => {
                 // After the native TLS handshake, perform hostname verification
@@ -398,6 +420,11 @@ export class Server extends NetServer {
 
         this.on('connection', (socket: Socket) => {
             const tlsSocket = new TLSSocket(socket);
+            // TLSSocket 复用了同一个 native driver 并覆盖了它的 onEvent（见 TLSSocket 构造函数），
+            // 所以原 Socket 再也收不到 CLOSE 事件 —— 继续跟踪它会让 _connections 只增不减，
+            // maxConnections 很快就被耗尽（TS-H1）。把跟踪转移到包装后的 tlsSocket。
+            this._untrackSocket(socket);
+            this._trackSocket(tlsSocket);
             this.emit('secureConnection', tlsSocket);
         });
 

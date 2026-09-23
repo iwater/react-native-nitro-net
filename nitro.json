@@ -25,7 +25,11 @@
             "rust_c_net"
         ],
         "extraLibDirs": [
-            "./lib"
+            "./mac"
+        ],
+        "extraFrameworks": [
+            "Security",
+            "CoreFoundation"
         ]
     }
 }

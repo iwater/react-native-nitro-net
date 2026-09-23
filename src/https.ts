@@ -1,16 +1,19 @@
 import * as http from './http'
 import * as tls from './tls'
 import { IncomingMessage } from './http'
+// 全局 `URL` 守卫与 http.ts 共用同一份（见 urlCompat.ts 文件头）。
+// 曾经这里漏改：https 侧裸写 `new URL` / `instanceof URL`，在无全局 URL 的宿主上
+// `https.request({...})` 会同步抛 `URL is not defined`（qjs 实测）。
+import { isURLLike, requireGlobalURL } from './urlCompat'
 
 // ========== Server ==========
 
 export class Server extends tls.Server {
     private _httpConnections = new Set<any>();
     public maxHeaderSize: number = 16384;
-    public maxRequestsPerSocket: number = 0;
     public headersTimeout: number = 60000;
-    public requestTimeout: number = 300000;
     public keepAliveTimeout: number = 5000;
+    // 同 http.Server：requestTimeout / maxRequestsPerSocket 这两个从未生效的字段已删除（Task 26）
 
     constructor(options?: any, requestListener?: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
         if (typeof options === 'function') {
@@ -31,8 +34,12 @@ export class Server extends tls.Server {
     }
 
     public setTimeout(ms: number, callback?: () => void): this {
-        // @ts-ignore - access netServer via super's internal or cast
-        (this as any)._netServer.setTimeout(ms, callback);
+        // 走继承链上的 net.Server.setTimeout。
+        // 此前这里写的是 `(this as any)._netServer.setTimeout(...)` —— 但 https.Server 的
+        // 继承链是 https.Server → tls.Server → net.Server，**没有** _netServer 字段，
+        // 于是 undefined.setTimeout 直接 TypeError（TS-H7）。
+        // 保留这个显式覆盖（而不是直接删掉）是为了让 tsc 校验基类方法确实存在。
+        super.setTimeout(ms, callback);
         return this;
     }
 }
@@ -46,9 +53,9 @@ export function createServer(options?: any, requestListener?: (req: http.Incomin
 export class ClientRequest extends http.ClientRequest {
     constructor(options: any, callback?: (res: http.IncomingMessage) => void) {
         if (typeof options === 'string') {
-            options = new URL(options);
+            options = new (requireGlobalURL('https.ClientRequest'))(options);
         }
-        if (options instanceof URL) {
+        if (isURLLike(options)) {
             options = {
                 protocol: options.protocol,
                 hostname: options.hostname,
@@ -70,14 +77,14 @@ export function request(
     let cb: ((res: http.IncomingMessage) => void) | undefined = callback;
 
     if (typeof urlOrOptions === 'string') {
-        const url = new URL(urlOrOptions);
+        const url = new (requireGlobalURL('https.request()'))(urlOrOptions);
         opts = {
             protocol: url.protocol,
             hostname: url.hostname,
             path: url.pathname + url.search,
             port: url.port ? parseInt(url.port) : 443
         };
-    } else if (urlOrOptions instanceof URL) {
+    } else if (isURLLike(urlOrOptions)) {
         opts = {
             protocol: urlOrOptions.protocol,
             hostname: urlOrOptions.hostname,

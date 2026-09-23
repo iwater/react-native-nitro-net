@@ -11,13 +11,74 @@ import { isVerbose, setVerbose, debugLog as loggerDebugLog } from './Logger'
 // Utils
 // -----------------------------------------------------------------------------
 
+// 严格校验，逐条对齐 Node（期望值来自 node -e 实测，见提交说明）：
+//   IPv4：4 段十进制 0-255，**不允许前导零**（'01.2.3.4' → 0）。
+//   IPv6：1-4 位十六进制组，最多一个 '::'；可带 zone id（'%eth0'）；
+//         结尾可嵌点分四段（占后 32 位，算 2 组，自身也按 IPv4 规则校验）。
+//   组数：无 '::' 必须正好 8 组；有 '::' 必须 < 8 组（否则压缩没有任何意义）。
+function isIPv4Literal(input: string): boolean {
+    if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(input)) return false;
+    const parts = input.split('.');
+    for (const p of parts) {
+        if (p.length > 1 && p[0] === '0') return false; // 前导零：Node 判 0
+        const n = Number(p);
+        if (!(n >= 0 && n <= 255)) return false;
+    }
+    return true;
+}
+
 function isIP(input: string): number {
-    // Simple regex check
-    if (/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(input)) return 4;
-    // Basic IPv6 check allowing double colons
-    if (/^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/.test(input)) return 6;
-    if (/^((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)::((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)$/.test(input)) return 6;
-    return 0;
+    if (typeof input !== 'string' || input.length === 0) return 0;
+    if (isIPv4Literal(input)) return 4;
+    if (!input.includes(':')) return 0;
+
+    // 去掉 zone id（'fe80::1%eth0' → 6，Node 接受）
+    const zoneIdx = input.indexOf('%');
+    const body = zoneIdx === -1 ? input : input.slice(0, zoneIdx);
+    if (body.length === 0) return 0;
+
+    // 按 '::' 切：多于一个即非法（'::::1.2.3.4' → 0）
+    const halves = body.split('::');
+    if (halves.length > 2) return 0;
+    const compressed = halves.length === 2;
+
+    let total = 0;
+    for (let hi = 0; hi < halves.length; hi++) {
+        const half = halves[hi];
+        if (half === '') continue;
+        const gs = half.split(':');
+        for (let gi = 0; gi < gs.length; gi++) {
+            const g = gs[gi];
+            if (g.includes('.')) {
+                // 内嵌的点分四段只可能出现在整串的最后一个 token
+                const isTail = (hi === halves.length - 1) && (gi === gs.length - 1);
+                if (!isTail || !isIPv4Literal(g)) return 0;
+                total += 2;
+            } else {
+                // 空组只在 '::' 处合法（已被切掉），这里出现就是形如 '1:2:3:4:5:6:7:8:'
+                if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return 0;
+                total++;
+            }
+        }
+    }
+    if (compressed) {
+        // '::' 至少要压缩掉一组；'1:2:3:4:5:6::7:8'（8 组）Node 判 0
+        if (total >= 8) return 0;
+    } else {
+        if (total !== 8) return 0;
+    }
+    return 6;
+}
+
+/**
+ * 造一个带 `code` 的错误。Node 的参数校验错误都带 code（调用方靠它分支），
+ * 裸 `new TypeError(msg)` 会让 `err.code` 恒为 undefined。
+ * 期望值来自 node -e 实测（见提交说明）。
+ */
+function errWithCode(Ctor: any, code: string, message: string): Error {
+    const err: any = new Ctor(message);
+    err.code = code;
+    return err as Error;
 }
 
 function isIPv4(input: string): boolean {
@@ -39,6 +100,33 @@ function decodeArrayBuffer(data: ArrayBuffer | undefined): string {
     }
     return Buffer.from(data).toString();
 }
+
+/**
+ * 解析 Rust 侧的 Node 风格错误消息（`connect ECONNREFUSED 127.0.0.1:1 (os error 61)`），
+ * 把 Node 系统错误契约挂到 Error 上：code / errno（负值平台 errno）/ syscall，
+ * 以及 connect、listen 类错误的 address / port。
+ * 不匹配该格式的消息（TLS、DNS、主动 abort 等）原样返回，不附加任何属性。
+ */
+const NODE_ERROR_RE = /^(\w+) (E[A-Z0-9]+) (\S+) \(os error (\d+)\)$/;
+function enrichSystemError<T extends Error>(error: T): T {
+    const m = NODE_ERROR_RE.exec(error.message);
+    if (!m) return error;
+    const [, syscall, code, target, errno] = m;
+    const e = error as any;
+    e.syscall = syscall;
+    e.code = code;
+    e.errno = -parseInt(errno, 10);
+    if (syscall === 'connect' || syscall === 'listen') {
+        // target 形如 "127.0.0.1:1" 或 "[::1]:80"
+        const idx = target.lastIndexOf(':');
+        if (idx > 0) {
+            e.address = target.slice(0, idx).replace(/^\[|\]$/g, '');
+            const p = parseInt(target.slice(idx + 1), 10);
+            if (!isNaN(p)) e.port = p;
+        }
+    }
+    return error;
+}
 // -----------------------------------------------------------------------------
 // Global Configuration
 // -----------------------------------------------------------------------------
@@ -48,7 +136,7 @@ let _isInitialized = false;
 
 
 
-function debugLog(message: string) {
+function debugLog(message: string | (() => string)) {
     loggerDebugLog('NET', message)
 }
 
@@ -87,15 +175,20 @@ function ensureInitialized(): void {
  * ```
  */
 function initWithConfig(config: NetConfig): void {
-    _isInitialized = true;
     if (config.debug !== undefined) {
         setVerbose(config.debug);
     }
-    // Inject dispatcher for async events to avoid thread starvation/deadlocks
+    // 顺序很重要：
+    // 1) 先让原生按 workerThreads 初始化 runtime。workerThreads 只在首次生效，
+    //    若先装 dispatcher（会兜底触发默认配置初始化），这里的配置就会被忽略。
+    Driver.initWithConfig(config);
+    // 2) 再装 dispatcher。用 dispatch 把事件投递到 JS 线程；缺失时原生侧会丢事件并告警。
+    //    这一步可能 throw——此时不置 _isInitialized，下一次 ensureInitialized() 可重试
+    //    （原生初始化是幂等的，重复调用不会重复 net_init）。
     if ((Driver as any).installDispatcher) {
         (Driver as any).installDispatcher();
     }
-    Driver.initWithConfig(config);
+    _isInitialized = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -300,7 +393,13 @@ export class Socket extends Duplex {
     public autoSelectFamilyAttemptedAddresses: string[] = [];
     private _autoSelectFamily: boolean = false;
     private _timeout: number = 0;
-    private _nativeWriteCallbacks: Array<(error?: Error | null) => void> = [];
+    /**
+     * 在途的原生写。readable-stream 保证任意时刻最多一个 `_write` 在途，
+     * 因此它与原生的 WRITTEN/BUSY 事件一一对应，无需关联 ID。
+     * 写入经 `driver.write()` 交给原生后，等 WRITTEN 才 `callback(null)`；
+     * 收到 BUSY 则重试同一份数据。
+     */
+    private _pendingNativeWrite?: { ab: ArrayBuffer; callback: (e?: Error | null) => void };
 
     get localFamily(): string {
         return this.localAddress && this.localAddress.includes(':') ? 'IPv6' : 'IPv4';
@@ -380,7 +479,8 @@ export class Socket extends Duplex {
                 this.emit('session', data);
                 return;
             }
-            debugLog(`Socket (id: ${id}, localPort: ${this.localPort}) Event TYPE: ${eventType}, data len: ${data?.byteLength}`);
+            // 热路径：每个原生事件都会走到这里（含每个数据包），用 thunk 避免 verbose 关闭时白拼字符串
+            debugLog(() => `Socket (id: ${id}, localPort: ${this.localPort}) Event TYPE: ${eventType}, data len: ${data?.byteLength}`);
             switch (eventType) {
                 case NetSocketEvent.CONNECT:
                     this.connecting = false;
@@ -392,7 +492,7 @@ export class Socket extends Duplex {
                     this.emit('ready');
                     break;
                 case NetSocketEvent.DATA:
-                    debugLog(`Socket onEvent(DATA), len: ${data?.byteLength}, flowing: ${(this as any).readableFlowing}`);
+                    debugLog(() => `Socket onEvent(DATA), len: ${data?.byteLength}, flowing: ${(this as any).readableFlowing}`);
                     if (data && data.byteLength > 0) {
                         const buffer = Buffer.from(data);
                         this.bytesRead += buffer.length;
@@ -406,7 +506,7 @@ export class Socket extends Duplex {
                 case NetSocketEvent.ERROR: {
                     this._hadError = true;
                     const errorMsg = decodeArrayBuffer(data) || 'Unknown socket error';
-                    const error = new Error(errorMsg);
+                    const error = enrichSystemError(new Error(errorMsg));
 
                     if (this.connecting && this._autoSelectFamily) {
                         // If we were connecting, this is a connection attempt failure
@@ -430,9 +530,25 @@ export class Socket extends Duplex {
                     this.push(null); // EOF
                     this.destroy();
                     break;
-                case NetSocketEvent.DRAIN:
+                case NetSocketEvent.BUSY: {
+                    // 原生写通道满：重试在途写（readable-stream 保证只有一个在途 _write）
+                    const pending = this._pendingNativeWrite;
+                    if (pending) {
+                        setImmediate(() => {
+                            if (this._pendingNativeWrite === pending && this._driver) {
+                                this._driver.write(pending.ab);
+                            }
+                        });
+                    }
+                    break;
+                }
+                case NetSocketEvent.DRAIN: { // 5 = WRITTEN，每条被接受的写各来一条
+                    const pending = this._pendingNativeWrite;
+                    this._pendingNativeWrite = undefined;
+                    if (pending) pending.callback(null);
                     this.emit('drain');
                     break;
+                }
                 case NetSocketEvent.TIMEOUT:
                     if (this.connecting && this._autoSelectFamily) {
                         const lastAttempt = this.autoSelectFamilyAttemptedAddresses[this.autoSelectFamilyAttemptedAddresses.length - 1];
@@ -508,6 +624,37 @@ export class Socket extends Duplex {
     }
 
     connect(options: any, connectionListener?: () => void): this {
+        // 参数校验对齐 Node（实测 v22，见提交说明）：
+        //   无参 / {} / 既无 port 也无 path  → ERR_MISSING_ARGS（TypeError）
+        //   port 存在但既不是 number 也不是 string（含 null）→ ERR_INVALID_ARG_TYPE
+        //   options 本身不是 object/number/string（true、Symbol…）→ ERR_INVALID_ARG_TYPE
+        // 裸 `options.path` 解引用会抛没有 code 的 TypeError，调用方无法按 code 分支。
+        if (options === undefined || options === null || typeof options === 'boolean') {
+            if (options === undefined) {
+                throw errWithCode(TypeError, 'ERR_MISSING_ARGS',
+                    'The "options" or "port" or "path" argument must be specified');
+            }
+            throw errWithCode(TypeError, 'ERR_INVALID_ARG_TYPE',
+                `The "options.port" property must be one of type number or string. Received ${options === null ? 'null' : `type boolean (${options})`}`);
+        }
+        if (typeof options !== 'object' && typeof options !== 'number' && typeof options !== 'string') {
+            throw errWithCode(TypeError, 'ERR_MISSING_ARGS',
+                'The "options" or "port" or "path" argument must be specified');
+        }
+
+        if (typeof options === 'object') {
+            const hasPort = options.port !== undefined;
+            const hasPath = options.path !== undefined && options.path !== null;
+            if (!hasPort && !hasPath) {
+                throw errWithCode(TypeError, 'ERR_MISSING_ARGS',
+                    'The "options" or "port" or "path" argument must be specified');
+            }
+            if (hasPort && typeof options.port !== 'number' && typeof options.port !== 'string') {
+                throw errWithCode(TypeError, 'ERR_INVALID_ARG_TYPE',
+                    `The "options.port" property must be one of type number or string. Received ${options.port === null ? 'null' : 'an instance of Object'}`);
+            }
+        }
+
         if (typeof options === 'string') {
             // Path?
             if (isNaN(Number(options))) {
@@ -518,10 +665,21 @@ export class Socket extends Duplex {
         if (typeof options === 'number' || typeof options === 'string') {
             const port = Number(options);
             const host = (arguments.length > 1 && typeof arguments[1] === 'string') ? arguments[1] : 'localhost';
-            const cb = typeof arguments[1] === 'function' ? arguments[1] : connectionListener;
+            // connect(port[, host][, cb]) 的回调位置随参数个数变化，必须在 arguments 上看：
+            //   (port, cb)        → arguments[1] 是函数
+            //   (port, host, cb)  → arguments[1] 是 host，回调在 arguments[2]
+            //   (port, host)      → **没有回调**（真实 Node 接受这个形式）
+            // ⚠️ 兜底**不能**用形参 `connectionListener` —— 它就是 `arguments[1]`，
+            //    在 `(port, host)` 这个形式下它是 host 字符串，于是
+            //    `once('connect', <string>)` 抛
+            //      TypeError: The "listener" argument must be of type Function. Received type string
+            //    （实测：三参形式与两参带回调形式都正常，只有 `(port, host)` 会抛。）
+            const cb = typeof arguments[1] === 'function'
+                ? arguments[1]
+                : (typeof arguments[2] === 'function' ? arguments[2] : undefined);
             // Default: Node 20 defaults autoSelectFamily to true
             this._autoSelectFamily = true;
-            return this._connect(port, host, cb || arguments[2]);
+            return this._connect(port, host, cb);
         }
 
         if (options.path) {
@@ -545,6 +703,13 @@ export class Socket extends Duplex {
     private _connect(port: number, host: string, listener?: () => void, signal?: AbortSignal): this {
         this.remotePort = port; // Store intended remote port
         if (this.connecting || this._connected) return this;
+        if (!this._driver) {
+            // destroy() 之后 _driver 被清空。原来这里是 `this._driver?.connect(...)`
+            // 静默空操作，但 connecting 已经置起来了 —— 于是 connect 永远既不来
+            // 'connect' 也不来 'error'，等它的人挂死。报出来（异步，对齐 Node 的
+            // 错误时机），并把 connecting 复位。
+            return this._failClosed();
+        }
         if (signal?.aborted) {
             process.nextTick(() => this.emit('error', new Error('The operation was aborted')));
             return this;
@@ -566,8 +731,24 @@ export class Socket extends Duplex {
         return this;
     }
 
+    /**
+     * driver 已消失（多是 destroy 之后）时的统一报错路径。
+     * 实测 Node：`new net.Socket()` 未连接就写是 `ERR_SOCKET_CLOSED / Socket is closed`
+     * （**既**回调 **也** emit 'error'）。这里没有 driver 可用，只能报出来。
+     */
+    private _failClosed(): this {
+        this.connecting = false;
+        const err = errWithCode(Error, 'ERR_SOCKET_CLOSED', 'Socket is closed');
+        const nextTick = typeof process !== 'undefined' && process.nextTick
+            ? process.nextTick.bind(process)
+            : (fn: () => void) => setTimeout(fn, 0);
+        nextTick(() => this.emit('error', err));
+        return this;
+    }
+
     private _connectUnix(path: string, listener?: () => void, signal?: AbortSignal): this {
         if (this.connecting || this._connected) return this;
+        if (!this._driver) return this._failClosed();
         if (signal?.aborted) {
             process.nextTick(() => this.emit('error', new Error('The operation was aborted')));
             return this;
@@ -605,31 +786,65 @@ export class Socket extends Duplex {
         return this;
     }
 
+    // 显式声明与 readable-stream `Writable.write` 相同的重载：
+    // 若压成单签名，调用点（如 http.ts 的 `socket.write(data, enc, (err) => ...)`）
+    // 会失去上下文类型推断而报隐式 any。
+    write(chunk: any, cb?: (error: Error | null | undefined) => void): boolean;
+    write(chunk: any, encoding?: string, cb?: (error: Error | null | undefined) => void): boolean;
+    write(chunk: any, encoding?: any, callback?: any): boolean {
+        const ret = super.write(chunk, encoding, callback);
+        // 原生写通道仍有在途写（等 WRITTEN/BUSY 裁决）时，如实返回 false 作为背压信号
+        return this._pendingNativeWrite ? false : ret;
+    }
+
     _write(chunk: any, encoding: string, callback: (error?: Error | null) => void): void {
         if (!this._driver) {
             return callback(new Error('Socket not connected'));
         }
         if (!this._connected && this.connecting) {
-            const onConnect = () => {
+            // 三条退出路径都要摘掉另外两条的监听，否则一次连接会残留监听，
+            // 下一次 deferral 时重复触发。
+            const cleanup = () => {
+                this.removeListener('connect', onConnect);
                 this.removeListener('error', onError);
+                this.removeListener('close', onClose);
+            };
+            const onConnect = () => {
+                cleanup();
                 this._write(chunk, encoding, callback);
             };
             const onError = (err: Error) => {
-                this.removeListener('connect', onConnect);
+                cleanup();
                 callback(err);
+            };
+            // 兜底：`destroy()` 不带错误时既不发 'error' 也不发 'connect'（只发 'close'），
+            // 于是 callback 永远不被调用 —— 流的 _write 悬挂，'finish' 再也不来。
+            // code 用 ERR_SOCKET_CLOSED_BEFORE_CONNECTION：实测 Node 在
+            // 「连到一半被 destroy」时给写回调的就是这个（连上之后再 destroy 是
+            // ERR_STREAM_DESTROYED；从未 connect 就写是 ERR_SOCKET_CLOSED）。
+            const onClose = () => {
+                cleanup();
+                callback(errWithCode(Error, 'ERR_SOCKET_CLOSED_BEFORE_CONNECTION',
+                    'Socket is closed before connection is established'));
             };
             this.once('connect', onConnect);
             this.once('error', onError);
+            this.once('close', onClose);
             return;
         }
         try {
             const buffer = (chunk instanceof Buffer) ? chunk : Buffer.from(chunk, encoding as any);
             this.bytesWritten += buffer.length;
             const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-            debugLog(`Socket _write, len: ${ab.byteLength}`);
+            debugLog(() => `Socket _write, len: ${ab.byteLength}`);
+            // 不改回立即 callback(null)：交给原生裁决
+            //   WRITTEN(5) → callback(null) 放行下一条
+            //   BUSY(12)   → 重试同一份数据
+            //   _destroy   → 以错误回调，避免悬挂
+            this._pendingNativeWrite = { ab, callback };
             this._driver.write(ab);
-            callback(null);
         } catch (err: any) {
+            this._pendingNativeWrite = undefined;
             callback(err);
         }
     }
@@ -643,16 +858,27 @@ export class Socket extends Duplex {
             return callback(null);
         }
         if (!this._connected && this.connecting) {
-            const onConnect = () => {
+            // 同 _write：'close' 兜底，否则 destroy() 无错误时 _final 悬挂 → 'finish' 不来
+            const cleanup = () => {
+                this.removeListener('connect', onConnect);
                 this.removeListener('error', onError);
+                this.removeListener('close', onClose);
+            };
+            const onConnect = () => {
+                cleanup();
                 this._final(callback);
             };
             const onError = () => {
-                this.removeListener('connect', onConnect);
+                cleanup();
                 callback(null); // Already destroyed/errored
+            };
+            const onClose = () => {
+                cleanup();
+                callback(null);
             };
             this.once('connect', onConnect);
             this.once('error', onError);
+            this.once('close', onClose);
             return;
         }
         debugLog(`Socket (localPort: ${this.localPort}) ._final() called, shutting down driver`);
@@ -670,6 +896,12 @@ export class Socket extends Duplex {
         this._connected = false;
         this.connecting = false;
         this.destroyed = true;
+        // 在途写不可能再等到 WRITTEN/BUSY：就地以错误回调，避免回调悬挂
+        const pending = this._pendingNativeWrite;
+        this._pendingNativeWrite = undefined;
+        if (pending) {
+            pending.callback(err ?? new Error('Socket destroyed'));
+        }
         if (this._driver) {
             this._driver.destroy();
             this._driver = undefined;
@@ -679,6 +911,15 @@ export class Socket extends Duplex {
 
     // Standard net.Socket methods
     setTimeout(msecs: number, callback?: () => void): this {
+        // 对齐 Node（实测 v22）：负数 / NaN / ±Infinity 抛
+        // `ERR_OUT_OF_RANGE: The value of "msecs" is out of range. It must be a non-negative finite number`。
+        // 0 是合法的（= 取消超时）。
+        // 原生侧另有钳制（HybridNetSocketDriver::clampMillis），但那是**纵深防御**——
+        // 负 double 转 uint64_t 是 UB（实测绕成 ~1.8e19 ms）。这里才是给调用方的报错面。
+        if (typeof msecs !== 'number' || !isFinite(msecs) || msecs < 0) {
+            throw errWithCode(RangeError, 'ERR_OUT_OF_RANGE',
+                `The value of "msecs" is out of range. It must be a non-negative finite number. Received ${msecs}`);
+        }
         this._timeout = msecs;
         if (this._driver) {
             this._driver.setTimeout(msecs);
@@ -744,7 +985,8 @@ export class Socket extends Duplex {
     }
 
     get bufferSize(): number {
-        return 0; // Deprecated but often accessed
+        // 已废弃但常被访问：返回在途原生写的字节数
+        return this._pendingNativeWrite ? this._pendingNativeWrite.ab.byteLength : 0;
     }
 
     resetAndDestroy(): this {
@@ -770,6 +1012,21 @@ export class Server extends EventEmitter {
 
     private _maxConnections: number = 0;
     private _dropMaxConnection: boolean = false;
+    /** server 级连接超时（毫秒，0 = 不设）；在 _trackSocket 里套用到每条新连接 */
+    private _timeout: number = 0;
+
+    /**
+     * 设置入站连接的超时（Node 的 `net.Server.setTimeout` 语义）。
+     *
+     * 此前 net.Server 没有这个方法，于是 `http.Server.setTimeout` 里的
+     * `this._netServer.setTimeout(...)`、以及 `https.Server` 里的
+     * `(this as any)._netServer.setTimeout(...)` 一调用就 TypeError（TS-H7）。
+     */
+    setTimeout(msecs: number, callback?: () => void): this {
+        this._timeout = msecs;
+        if (callback) this.on('timeout', callback);
+        return this;
+    }
 
     get maxConnections(): number {
         return this._maxConnections;
@@ -796,6 +1053,42 @@ export class Server extends EventEmitter {
         // But typically 'listening' is true after 'listening' event.
         // We can track it with a private flag or by checking address() which returns null if not listening.
         return !!this.address();
+    }
+
+    /**
+     * 登记一条被 server 跟踪的连接。子类也用它（tls.ts 包装出 TLSSocket 时）。
+     * 幂等：同一个 socket 重复登记不会重复计数。
+     */
+    protected _trackSocket(socket: Socket): void {
+        if (this._sockets.has(socket)) return;
+        this._sockets.add(socket);
+        this._connections++;
+        // server 级超时（setTimeout 设的）套用到每条新连接，并把 socket 的 timeout
+        // 转发到 server —— 注意这里用的是 socket.setTimeout(ms)（不带回调），
+        // 回调语义由 server 自己的 'timeout' 事件承担。
+        if (this._timeout > 0) {
+            socket.setTimeout(this._timeout);
+            socket.on('timeout', () => this.emit('timeout', socket));
+        }
+        socket.on('close', () => {
+            // 已被 _untrackSocket 摘除的 socket 不再计数，否则会双重递减
+            if (!this._sockets.has(socket)) return;
+            this._connections--;
+            this._sockets.delete(socket);
+        });
+    }
+
+    /**
+     * 把一条连接从跟踪里摘除（不再计入 `_connections`）。
+     *
+     * 用于"连接被接管"的场景：tls.ts 用 `TLSSocket` 包住原 `Socket` 后，原 Socket 的
+     * native driver `onEvent` 被覆盖、再也收不到 CLOSE，必须改跟踪包装后的对象，
+     * 否则 `_connections` 只增不减（TS-H1）。
+     */
+    protected _untrackSocket(socket: Socket): void {
+        if (!this._sockets.has(socket)) return;
+        this._connections--;
+        this._sockets.delete(socket);
     }
 
     constructor(options?: any, connectionListener?: (socket: Socket) => void) {
@@ -860,13 +1153,8 @@ export class Server extends EventEmitter {
                             socket._updateAddresses();
                             debugLog(`Socket initialized addresses: local=${socket.localAddress}:${socket.localPort}, remote=${socket.remoteAddress}:${socket.remotePort}`);
 
-                            // Keep reference to prevent GC
-                            this._sockets.add(socket);
-                            this._connections++;
-                            socket.on('close', () => {
-                                this._connections--;
-                                this._sockets.delete(socket);
-                            });
+                            // Keep reference to prevent GC（统一走 _trackSocket，子类复用同一套计数）
+                            this._trackSocket(socket);
                             this.emit('connection', socket);
                             // Start reading only after 'connection' handlers ran.
                             // This prevents dropping data when listeners are attached in the callback.
@@ -876,7 +1164,7 @@ export class Server extends EventEmitter {
                     break;
                 }
                 case NetServerEvent.ERROR:
-                    this.emit('error', new Error(decodeArrayBuffer(data) || 'Unknown server error'));
+                    this.emit('error', enrichSystemError(new Error(decodeArrayBuffer(data) || 'Unknown server error')));
                     break;
                 case NetServerEvent.DEBUG: {
                     debugLog(`Server NATIVE SESSION/DEBUG EVENT RECEIVED`);
@@ -963,7 +1251,8 @@ export class Server extends EventEmitter {
         } else if (_path) {
             this._driver.listenUnix(_path, _backlog);
         } else {
-            this._driver.listen(_port || 0, _backlog, ipv6Only, reusePort);
+            // _host 透传（Node 语义：listen(port, host) 绑定指定地址；undefined 时绑通配）
+            this._driver.listen(_port || 0, _host, _backlog, ipv6Only, reusePort);
         }
 
         return this;
@@ -1009,9 +1298,14 @@ export class Server extends EventEmitter {
 // Exports
 // -----------------------------------------------------------------------------
 
-export function createConnection(options: any, connectionListener?: () => void): Socket {
-    const socket = new Socket(options);
-    return socket.connect(options, connectionListener);
+// Node 支持 createConnection(port[, host][, connectListener]) 与
+// createConnection(options[, connectListener]) 两种形式。原实现只声明两个形参，
+// 三参形式的回调会被整个丢掉、host 被当成回调传下去（实测抛
+// `TypeError: The "listener" argument must be of type Function. Received type string`，
+// 真实 Node 不抛）。这里原样转发全部参数，由 connect() 归一。
+export function createConnection(...args: any[]): Socket {
+    const socket = new Socket(args[0]);
+    return (socket.connect as any)(...args);
 }
 
 export const connect = createConnection;

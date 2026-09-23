@@ -16,12 +16,13 @@ export enum NetSocketEvent {
     DATA = 2,
     ERROR = 3,
     CLOSE = 4,
-    DRAIN = 5,
+    DRAIN = 5, // = 原生 NET_EVENT_WRITTEN：每条被接受的写各来一条
     TIMEOUT = 7,
     LOOKUP = 8,
     SESSION = 9,
     KEYLOG = 10,
-    OCSP = 11
+    OCSP = 11,
+    BUSY = 12 // 写通道满，需要在途写重试（背压）
 }
 
 export interface NetSocketDriver extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
@@ -68,7 +69,12 @@ export enum NetServerEvent {
 
 export interface NetServerDriver extends HybridObject<{ ios: 'swift', android: 'kotlin' }> {
     onEvent: (event: number, data: ArrayBuffer) => void
-    listen(port: number, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
+    /**
+     * Listen on a TCP port.
+     * @param host 绑定地址（Node 语义：IP 字面量或主机名，省略时绑通配地址）。
+     *             此前接口没有此参数，JS 传入的 host 被静默丢弃、恒绑通配。
+     */
+    listen(port: number, host?: string, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
     listenTLS(port: number, secureContextId: number, backlog?: number, ipv6Only?: boolean, reusePort?: boolean): void
     listenUnix(path: string, backlog?: number): void
     listenTLSUnix(path: string, secureContextId: number, backlog?: number): void

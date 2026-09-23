@@ -6,3 +6,11 @@ lib
 .git
 .yarn
 .gradle
+
+# 预编译 mac 库（由 yarn copy-clib-mac 从 rust_c_net 产出，不入库）
+/mac/
+
+# 构建 / 打包 / 日志产物
+*.log
+*.tgz
+package-lock.json

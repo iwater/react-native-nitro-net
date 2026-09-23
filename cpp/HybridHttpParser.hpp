@@ -66,15 +66,11 @@ public:
       return HttpParsedMessage("ERROR: Re-parse failed after enlarging buffer",
                                std::nullopt);
     } else {
-      // Error
+      // Error 分支：Rust 侧只会返回 -3（parser 不存在）；缓冲区不足是 < -3（上面已处理），
+      // 解析失败则以 `ERROR:` 前缀的 metadata 走 res > 0 路径。原先的 -1/-2 分支
+      // 是死代码（Rust 从不返回这两个值），已删除（C-M4）。
       std::string error;
       switch (res) {
-      case -1:
-        error = "ERROR: JSON serialization failed";
-        break;
-      case -2:
-        error = "ERROR: HTTP parse failed";
-        break;
       case -3:
         error = "ERROR: Parser not found";
         break;
