@@ -129,4 +129,5 @@ export interface NetDriver extends HybridObject<{ ios: 'swift', android: 'kotlin
      * @param config Configuration options
      */
     initWithConfig(config: NetConfig): void
+    getNetworkInterfaces(): string
 }

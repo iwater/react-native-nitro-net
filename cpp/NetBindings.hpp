@@ -228,6 +228,8 @@ int net_socket_export_keying_material(uint32_t id,
                                       uint8_t *buf,
                                       uintptr_t buf_len);
 
+uintptr_t net_get_interfaces(char *buf, uintptr_t len);
+
 } // extern "C"
 
 #endif // NET_BINDINGS_H

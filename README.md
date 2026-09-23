@@ -226,6 +226,7 @@ server.listen(0, '127.0.0.1', () => {
 | `initWithConfig(options)` | Optional. Initializes the Rust runtime with custom settings (e.g., `workerThreads`, `debug`). Must be called before any other operation. |
 | `setVerbose(bool)` | Toggle detailed logging for JS, C++, and Rust. |
 | `isIP(string)` | Returns `0`, `4`, or `6`. |
+| `networkInterfaces()` | Returns JSON-compatible object of local network interfaces (similar to Node's `os.networkInterfaces()`). |
 
 ### `net.Server`
 

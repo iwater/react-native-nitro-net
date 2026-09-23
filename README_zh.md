@@ -219,9 +219,10 @@ server.listen(0, '127.0.0.1', () => {
 
 | 方法 | 说明 |
 | --- | --- |
-| `initWithConfig(options)` | 可选。使用自定义设置 (例如 `workerThreads`, `debug`) 初始化 Rust 运行时。必须在进行任何其他操作前调用。 |
+| `initWithConfig(options)` | 可选。使用自定义设置 (例如 `workerThreads`, `debug`) 初始化 Rust 运行时。必须在进行 any 其他操作前调用。 |
 | `setVerbose(bool)` | 开启/关闭 JS、C++ 和 Rust 的详细日志。 |
 | `isIP(string)` | 返回 `0`, `4`, 或 `6`。 |
+| `networkInterfaces()` | 返回本地网络接口的 JSON 兼容对象 (类似于 Node 的 `os.networkInterfaces()`)。 |
 
 ### `net.Server`
 

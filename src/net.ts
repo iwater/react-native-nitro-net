@@ -1020,6 +1020,72 @@ export function createServer(options?: any, connectionListener?: (socket: Socket
     return new Server(options, connectionListener);
 }
 
+function ipv4NetmaskToPrefix(netmask: string): number {
+    return netmask.split('.').reduce((c, o) => {
+        let octet = parseInt(o, 10);
+        if (isNaN(octet)) return c;
+        while (octet > 0) {
+            if (octet & 1) c++;
+            octet >>= 1;
+        }
+        return c;
+    }, 0);
+}
+
+function ipv6NetmaskToPrefix(netmask: string): number {
+    return netmask.split(':').reduce((c, part) => {
+        if (!part) return c;
+        let val = parseInt(part, 16);
+        if (isNaN(val)) return c;
+        while (val > 0) {
+            if (val & 1) c++;
+            val >>= 1;
+        }
+        return c;
+    }, 0);
+}
+
+export interface NetworkInterfaceInfo {
+    address: string;
+    netmask: string;
+    family: 'IPv4' | 'IPv6';
+    mac: string;
+    internal: boolean;
+    cidr: string | null;
+}
+
+export function networkInterfaces(): Record<string, NetworkInterfaceInfo[]> {
+    ensureInitialized();
+    try {
+        const jsonStr = Driver.getNetworkInterfaces();
+        const raw = JSON.parse(jsonStr) as Record<string, Omit<NetworkInterfaceInfo, 'cidr'>[]>;
+        const result: Record<string, NetworkInterfaceInfo[]> = {};
+        
+        for (const name of Object.keys(raw)) {
+            result[name] = raw[name].map(entry => {
+                let cidr: string | null = null;
+                if (entry.address && entry.netmask) {
+                    const prefix = entry.family === 'IPv4' 
+                        ? ipv4NetmaskToPrefix(entry.netmask) 
+                        : ipv6NetmaskToPrefix(entry.netmask);
+                    cidr = `${entry.address}/${prefix}`;
+                }
+                return {
+                    address: entry.address,
+                    netmask: entry.netmask,
+                    family: entry.family,
+                    mac: entry.mac,
+                    internal: entry.internal,
+                    cidr
+                };
+            });
+        }
+        return result;
+    } catch (e) {
+        debugLog(`Failed to parse network interfaces: ${e}`);
+        return {};
+    }
+}
 
 export {
     isIP,
@@ -1049,4 +1115,5 @@ export default {
     setDefaultAutoSelectFamily,
     setVerbose,
     initWithConfig,
+    networkInterfaces,
 };

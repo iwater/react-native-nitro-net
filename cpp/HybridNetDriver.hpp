@@ -129,6 +129,15 @@ public:
       net_set_debug(config.debug.value());
     }
   }
+
+  std::string getNetworkInterfaces() override {
+    char buf[32768];
+    size_t len = ::net_get_interfaces(buf, sizeof(buf));
+    if (len > 0) {
+      return std::string(buf, len);
+    }
+    return "{}";
+  }
 };
 
 } // namespace net
