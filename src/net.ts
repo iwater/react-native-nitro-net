@@ -1325,17 +1325,41 @@ export class Server extends EventEmitter {
         return this;
     }
 
+    /**
+     * 停止接受新连接（**对齐 Node**）。
+     *
+     * ⚠️ 与旧实现的差异：旧实现会 `for (const s of this._sockets) s.destroy()` ——
+     * 把所有已建立的连接一起销毁。那与 Node 的 `server.close()` 语义不同，并且会
+     * 制造「在途 native write 被销毁」的场景：`Socket._destroy` 会给它的回调一个
+     * `Error('Socket destroyed')`，在 RN 上表现为**未捕获错误 / 红屏**
+     * （实测来源：示例 App 在响应回调里 `close()`）。
+     * Node 下那段代码永远走不到那条路径（`close()` 不碰已建立的连接），
+     * 所以这里对齐 Node：**只停止接受新连接，已建立的连接自然结束**。
+     *
+     * 想立刻掐断所有连接用 [`closeAllConnections()`]（对齐 Node 18.2+）。
+     *
+     * 已知偏差（保留，未对齐）：Node 的 `close(cb)` 会等**所有连接结束**才回调；
+     * 这里 `'close'` 仍随监听器关闭而发射（回调不等连接）。要等连接结束，
+     * 自己监听各连接的 `'close'`，或先 `closeAllConnections()`。
+     */
     close(callback?: (err?: Error) => void): this {
-        // Destroy all active connections first
+        this._driver.close();
+        if (callback) this.once('close', callback);
+        return this;
+    }
+
+    /**
+     * 立刻销毁所有已建立的连接（对齐 Node 18.2+ 的 `server.closeAllConnections()`）。
+     *
+     * 这是旧 `close()` 的行为，现在**显式**提供：需要确定性掐断时用它，
+     * 但要知道它会打断在途的写（调用方可能因此收到 `Socket destroyed`）。
+     */
+    closeAllConnections(): void {
         for (const socket of this._sockets) {
             socket.destroy();
         }
         this._sockets.clear();
         this._connections = 0;
-
-        this._driver.close();
-        if (callback) this.once('close', callback);
-        return this;
     }
 
     address(): { port: number; family: string; address: string } | null {
