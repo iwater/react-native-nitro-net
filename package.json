@@ -33,7 +33,8 @@
         "copy-clib": "npm run copy-clib-android && npm run copy-clib-ios && npm run copy-clib-mac",
         "copy-clib-android": "mkdir -p android/libs/arm64-v8a android/libs/armeabi-v7a android/libs/x86 android/libs/x86_64 && cp ../rust_c_net/target/aarch64-linux-android/release/librust_c_net.so android/libs/arm64-v8a/ && cp ../rust_c_net/target/armv7-linux-androideabi/release/librust_c_net.so android/libs/armeabi-v7a/ && cp ../rust_c_net/target/i686-linux-android/release/librust_c_net.so android/libs/x86/ && cp ../rust_c_net/target/x86_64-linux-android/release/librust_c_net.so android/libs/x86_64/ && cp ../rust_c_net/include/NetBindings.hpp cpp/",
         "copy-clib-ios": "rm -rf ios/Frameworks/RustCNet.xcframework && cp -R ../rust_c_net/target/xcframework/RustCNet.xcframework ios/Frameworks/",
-        "copy-clib-mac": "mkdir -p mac && cp ../rust_c_net/target/release/librust_c_net.a mac/ && cp ../rust_c_net/include/NetBindings.hpp cpp/"
+        "copy-clib-mac": "mkdir -p mac && cp ../rust_c_net/target/release/librust_c_net.a mac/ && cp ../rust_c_net/include/NetBindings.hpp cpp/",
+        "test:js": "node --experimental-strip-types --test \"tests/js/**/*.test.ts\""
     },
     "dependencies": {
         "eventemitter3": "^5.0.1",

@@ -298,63 +298,83 @@ export class TLSSocket extends Socket {
 
         if (driver) {
             this.connecting = true;
-            if (listener) this.once('secureConnect', listener);
+            // 本 override 不调 super.connect —— 只在 net.ts 的 _connect 埋点的话，
+            // TLS client（含 https client）永不 ref，无头宿主下事件循环提前收泵。
+            // 释放走 Socket._destroy（'close' 的唯一出口）。
+            this._acquireLoopRef();
+            // 下面直到 driver.connect* 之间都可能**同步**抛 —— 抛点在 Nitro/JSI 边界：
+            // cert/key/session 传了非 string 的类型（Node 的 tls 收 Buffer，用户照抄
+            // `fs.readFileSync` 就会踩到）、以及 driver.connect* 自身。
+            // ⚠️ 「PEM 解析失败」**不算**：原生 net_secure_context_set_cert_key 解析不出
+            // 证书时只 log + return（rust_c_net/src/ffi.rs），失败推迟到握手的异步阶段，
+            // 走正常 ERROR/CLOSE 释放 —— 别把它当成本块的抛点。
+            // 同 net.ts listen / tls.Server.listen 的写法：没有 handle 就不该留下 ref。
+            try {
+                if (listener) this.once('secureConnect', listener);
 
-            this.once('connect', () => {
-                // After the native TLS handshake, perform hostname verification
-                if (rejectUnauthorized !== false) {
-                    const cert = this.getPeerCertificate() as PeerCertificate;
-                    if (cert && Object.keys(cert).length > 0) {
-                        const verifyFn = (typeof options === 'object' && options.checkServerIdentity)
-                            ? options.checkServerIdentity
-                            : checkServerIdentity;
-                        const verifyErr = verifyFn(servername, cert);
-                        if (verifyErr) {
-                            this.emit('error', verifyErr);
-                            this.destroy(verifyErr);
-                            return;
+                this.once('connect', () => {
+                    // After the native TLS handshake, perform hostname verification
+                    if (rejectUnauthorized !== false) {
+                        const cert = this.getPeerCertificate() as PeerCertificate;
+                        if (cert && Object.keys(cert).length > 0) {
+                            const verifyFn = (typeof options === 'object' && options.checkServerIdentity)
+                                ? options.checkServerIdentity
+                                : checkServerIdentity;
+                            const verifyErr = verifyFn(servername, cert);
+                            if (verifyErr) {
+                                this.emit('error', verifyErr);
+                                this.destroy(verifyErr);
+                                return;
+                            }
                         }
                     }
+                    this.emit('secureConnect')
+                })
+
+                if (session) {
+                    driver.setSession(session)
                 }
-                this.emit('secureConnect')
-            })
 
-            if (session) {
-                driver.setSession(session)
-            }
+                const secureContext = (typeof options === 'object' && options.secureContext) ? options.secureContext : undefined;
+                let secureContextId: number | undefined = secureContext ? secureContext.id : undefined;
 
-            const secureContext = (typeof options === 'object' && options.secureContext) ? options.secureContext : undefined;
-            let secureContextId: number | undefined = secureContext ? secureContext.id : undefined;
+                // If cert/key/ca provided directly, create a temporary secure context
+                if (!secureContextId && typeof options === 'object' && (options.cert || options.key || options.ca)) {
+                    secureContextId = createSecureContext({
+                        cert: options.cert,
+                        key: options.key,
+                        ca: options.ca
+                    }).id;
+                }
 
-            // If cert/key/ca provided directly, create a temporary secure context
-            if (!secureContextId && typeof options === 'object' && (options.cert || options.key || options.ca)) {
-                secureContextId = createSecureContext({
-                    cert: options.cert,
-                    key: options.key,
-                    ca: options.ca
-                }).id;
-            }
+                if (options && options.keylog) {
+                    driver.enableKeylog()
+                }
 
-            if (options && options.keylog) {
-                driver.enableKeylog()
-            }
-
-            if (path) {
-                if (secureContextId !== undefined) {
-                    debugLog(`TLSSocket.connect: Calling driver.connectUnixTLSWithContext(${path}, ${servername}, ctx=${secureContextId})`);
-                    driver.connectUnixTLSWithContext(path, servername, rejectUnauthorized, secureContextId)
+                if (path) {
+                    if (secureContextId !== undefined) {
+                        debugLog(`TLSSocket.connect: Calling driver.connectUnixTLSWithContext(${path}, ${servername}, ctx=${secureContextId})`);
+                        driver.connectUnixTLSWithContext(path, servername, rejectUnauthorized, secureContextId)
+                    } else {
+                        debugLog(`TLSSocket.connect: Calling driver.connectUnixTLS(${path}, ${servername})`);
+                        driver.connectUnixTLS(path, servername, rejectUnauthorized)
+                    }
                 } else {
-                    debugLog(`TLSSocket.connect: Calling driver.connectUnixTLS(${path}, ${servername})`);
-                    driver.connectUnixTLS(path, servername, rejectUnauthorized)
+                    if (secureContextId !== undefined) {
+                        debugLog(`TLSSocket.connect: Calling driver.connectTLSWithContext(${host}, ${port}, ${servername}, ctx=${secureContextId})`);
+                        driver.connectTLSWithContext(host, port, servername, rejectUnauthorized, secureContextId)
+                    } else {
+                        debugLog(`TLSSocket.connect: Calling driver.connectTLS(${host}, ${port}, ${servername})`);
+                        driver.connectTLS(host, port, servername, rejectUnauthorized)
+                    }
                 }
-            } else {
-                if (secureContextId !== undefined) {
-                    debugLog(`TLSSocket.connect: Calling driver.connectTLSWithContext(${host}, ${port}, ${servername}, ctx=${secureContextId})`);
-                    driver.connectTLSWithContext(host, port, servername, rejectUnauthorized, secureContextId)
-                } else {
-                    debugLog(`TLSSocket.connect: Calling driver.connectTLS(${host}, ${port}, ${servername})`);
-                    driver.connectTLS(host, port, servername, rejectUnauthorized)
-                }
+            } catch (e) {
+                // 同步抛（如用户传的 cert/key 非法、createSecureContext 抛）时回滚：
+                // ref 已计、connecting 已置位，若不释放，永远不会有原生 handle 发 CLOSE
+                // → 无头宿主下事件循环被顶住、进程挂死。
+                this._releaseLoopRef();
+                this.connecting = false;
+                throw e;
             }
         }
 
@@ -425,6 +445,11 @@ export class Server extends NetServer {
             // maxConnections 很快就被耗尽（TS-H1）。把跟踪转移到包装后的 tlsSocket。
             this._untrackSocket(socket);
             this._trackSocket(tlsSocket);
+            // LoopRef 随 driver 一起转移：原 socket 的 onEvent 已被 TLSSocket 覆盖、
+            // 再也收不到 CLOSE，它在 accept 时 acquire 的 ref 必须在这里释放，
+            // 否则每连接泄漏一次 → 进程挂死。
+            socket._releaseLoopRef();
+            tlsSocket._acquireLoopRef();
             this.emit('secureConnection', tlsSocket);
         });
 
@@ -506,13 +531,23 @@ export class Server extends NetServer {
 
         const driver = (this as any)._driver;
 
-        if (_path) {
-            driver.listenTLSUnix(_path, this._secureContextId, _backlog);
-        } else if (handle) {
-            console.warn("TLS over handles not fully implemented yet");
-            driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
-        } else {
-            driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
+        // 本 override 只在这条分支里自己调 driver.listenTLS*，完全绕过 net.ts 的
+        // Server.listen —— 不在这里登记的话，listening 的 tls.Server（含 https.Server）
+        // 永不 ref。释放侧无需动：tls.Server 复用 net.Server 构造器装的 onEvent
+        // switch，CLOSE/ERROR 的 release 路径本来就走得到。
+        this._acquireLoopRef();
+        try {
+            if (_path) {
+                driver.listenTLSUnix(_path, this._secureContextId, _backlog);
+            } else if (handle) {
+                console.warn("TLS over handles not fully implemented yet");
+                driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
+            } else {
+                driver.listenTLS(_port || 0, this._secureContextId, _backlog, ipv6Only, reusePort);
+            }
+        } catch (e) {
+            this._releaseLoopRef();
+            throw e;
         }
 
         return this;

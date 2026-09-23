@@ -6,6 +6,7 @@ import { Driver } from './Driver'
 import type { NetSocketDriver, NetServerDriver, NetConfig } from './Net.nitro'
 import { NetSocketEvent, NetServerEvent } from './Net.nitro'
 import { isVerbose, setVerbose, debugLog as loggerDebugLog } from './Logger'
+import { LoopRef } from './loopRef'
 
 // -----------------------------------------------------------------------------
 // Utils
@@ -401,6 +402,17 @@ export class Socket extends Duplex {
      */
     private _pendingNativeWrite?: { ab: ArrayBuffer; callback: (e?: Error | null) => void };
 
+    /**
+     * Node handle-ref 语义的宿主登记槽：connecting / connected 的 socket 顶住事件循环。
+     * 宿主不支持该能力时（React Native）全部方法 no-op，行为与今天一致。
+     */
+    private _loopRef = new LoopRef('net.Socket');
+
+    /** @internal 供 Server accept / tls.Server 包装路径做 ref 转移；外部勿用。 */
+    _acquireLoopRef(): void { this._loopRef.acquire(); }
+    /** @internal 供 tls.Server 包装路径释放被接管 socket 的 ref；外部勿用。 */
+    _releaseLoopRef(): void { this._loopRef.release(); }
+
     get localFamily(): string {
         return this.localAddress && this.localAddress.includes(':') ? 'IPv6' : 'IPv4';
     }
@@ -726,6 +738,9 @@ export class Socket extends Duplex {
             this.once('close', () => signal.removeEventListener('abort', abortHandler));
         }
 
+        // 过完全部早退守卫之后才登记 handle-ref：没真的发起连接就不该顶住 loop。
+        // 释放出口是 _destroy（'close' 的唯一来源）与 resetAndDestroy。
+        this._loopRef.acquire();
         debugLog(`Socket._connect: Calling driver.connect(${host}, ${port})`);
         this._driver?.connect(host, port);
         return this;
@@ -765,6 +780,7 @@ export class Socket extends Duplex {
             this.once('close', () => signal.removeEventListener('abort', abortHandler));
         }
 
+        this._loopRef.acquire();
         this._driver?.connectUnix(path);
         return this;
     }
@@ -893,6 +909,8 @@ export class Socket extends Duplex {
 
     _destroy(err: Error | null, callback: (error: Error | null) => void) {
         debugLog(`Socket (localPort: ${this.localPort}) ._destroy() called`);
+        // 'close' 的唯一出口 —— handle-ref 在这里归零（Node：handle 销毁即 unref）
+        this._loopRef.release();
         this._connected = false;
         this.connecting = false;
         this.destroyed = true;
@@ -968,8 +986,18 @@ export class Socket extends Duplex {
         return this;
     }
 
-    ref(): this { return this; }
-    unref(): this { return this; }
+    /**
+     * Node：`ref()` 只对仍活跃的 handle 有意义 —— 对已销毁的 socket 调 ref()
+     * 是 no-op（否则会在 close 之后重新顶住 loop，进程挂死）。
+     */
+    ref(): this {
+        if ((this._connected || this.connecting) && !this.destroyed) this._loopRef.acquire();
+        return this;
+    }
+    unref(): this {
+        this._loopRef.release();
+        return this;
+    }
 
     /**
      * Set the encoding for the socket as a Readable Stream.
@@ -990,6 +1018,9 @@ export class Socket extends Duplex {
     }
 
     resetAndDestroy(): this {
+        // 绕过 _destroy 的独立销毁路径（它直接清 driver 并置 destroyed），
+        // 必须自己归零 handle-ref，否则进程挂死。
+        this._loopRef.release();
         if (this._driver) {
             this._driver.resetAndDestroy();
             this._driver = undefined;
@@ -1007,6 +1038,8 @@ export class Socket extends Duplex {
 
 export class Server extends EventEmitter {
     private _driver: NetServerDriver;
+    /** Node handle-ref 语义：listening 的 server 顶住事件循环。RN 上全部 no-op。 */
+    private _loopRef = new LoopRef('net.Server');
     private _sockets = new Set<Socket>();
     private _connections: number = 0;
 
@@ -1127,6 +1160,9 @@ export class Server extends EventEmitter {
                                 });
                                 // @ts-ignore
                                 socket._updateAddresses();
+                                // accepted socket 持有 handle（Node 语义）。紧接着的
+                                // destroy() → _destroy 会归零，天然配对。
+                                socket._acquireLoopRef();
 
                                 this.emit('drop', {
                                     localAddress: socket.localAddress,
@@ -1153,6 +1189,8 @@ export class Server extends EventEmitter {
                             socket._updateAddresses();
                             debugLog(`Socket initialized addresses: local=${socket.localAddress}:${socket.localPort}, remote=${socket.remoteAddress}:${socket.remotePort}`);
 
+                            // accepted socket 持有 handle（Node 语义）；释放走 _destroy。
+                            socket._acquireLoopRef();
                             // Keep reference to prevent GC（统一走 _trackSocket，子类复用同一套计数）
                             this._trackSocket(socket);
                             this.emit('connection', socket);
@@ -1164,6 +1202,9 @@ export class Server extends EventEmitter {
                     break;
                 }
                 case NetServerEvent.ERROR:
+                    // listen 失败（EADDRINUSE 等）时 'close' 不一定来 —— 这条路径必须
+                    // 自己归零，否则 server 的 ref 泄漏、进程永不退出。
+                    if (!this.listening) this._loopRef.release();
                     this.emit('error', enrichSystemError(new Error(decodeArrayBuffer(data) || 'Unknown server error')));
                     break;
                 case NetServerEvent.DEBUG: {
@@ -1172,6 +1213,9 @@ export class Server extends EventEmitter {
                     break;
                 }
                 case NetServerEvent.CLOSE:
+                    // handle 销毁即 unref。必须在 emit 之前：'close' 回调里可能再
+                    // 建新 handle，顺序反了会短暂误判为「还有活 handle」。
+                    this._loopRef.release();
                     this.emit('close');
                     break;
             }
@@ -1179,8 +1223,23 @@ export class Server extends EventEmitter {
     }
 
 
-    ref(): this { return this; }
-    unref(): this { return this; }
+    /** @internal 供 tls.Server.listen 等子类 override 路径使用；外部勿用。 */
+    _acquireLoopRef(): void { this._loopRef.acquire(); }
+    /** @internal 供子类 override 路径回退登记用；外部勿用。 */
+    _releaseLoopRef(): void { this._loopRef.release(); }
+
+    /**
+     * Node：`ref()` 只对仍 listening 的 server 有意义 —— 已 close 的 server
+     * 调 ref() 是 no-op（否则会重新顶住 loop，进程挂死）。
+     */
+    ref(): this {
+        if (this.listening) this._loopRef.acquire();
+        return this;
+    }
+    unref(): this {
+        this._loopRef.release();
+        return this;
+    }
 
     // @ts-ignore
     [Symbol.asyncDispose](): Promise<void> {
@@ -1245,14 +1304,22 @@ export class Server extends EventEmitter {
             this.once('close', () => signal.removeEventListener('abort', abortHandler));
         }
 
-        if (handle && typeof handle.fd === 'number') {
-            // Listen on an existing file descriptor (handle)
-            this._driver.listenHandle(handle.fd, _backlog);
-        } else if (_path) {
-            this._driver.listenUnix(_path, _backlog);
-        } else {
-            // _host 透传（Node 语义：listen(port, host) 绑定指定地址；undefined 时绑通配）
-            this._driver.listen(_port || 0, _host, _backlog, ipv6Only, reusePort);
+        // listening 的 server 持有 handle（Node 语义）→ 在调 native 之前登记。
+        // 同步抛错则回退登记再重抛：没有 handle 就不该留下 ref。
+        this._loopRef.acquire();
+        try {
+            if (handle && typeof handle.fd === 'number') {
+                // Listen on an existing file descriptor (handle)
+                this._driver.listenHandle(handle.fd, _backlog);
+            } else if (_path) {
+                this._driver.listenUnix(_path, _backlog);
+            } else {
+                // _host 透传（Node 语义：listen(port, host) 绑定指定地址；undefined 时绑通配）
+                this._driver.listen(_port || 0, _host, _backlog, ipv6Only, reusePort);
+            }
+        } catch (e) {
+            this._loopRef.release();
+            throw e;
         }
 
         return this;
