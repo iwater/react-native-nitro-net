@@ -33,7 +33,7 @@ The `https` module now provides full API compatibility. It correctly extends `tl
 | `options.checkServerIdentity` | ✅ Supported | Automatically called in `connect` flow. |
 | `options.timeout` | ✅ Supported | Inherited from `http.ClientRequest`. |
 | `options.maxCachedSessions` | ✅ Supported | Session caching enabled by default. |
-| `event: 'keylog'` | ✅ Supported | Re-emitted from managed TLS sockets. |
+| `event: 'keylog'` | ✅ Supported（H1 与 H2 同形） | 落点是 **Agent**（`Agent.createConnection` 把 TLSSocket 的 'keylog' 转成 `agent.emit('keylog', line, socket)`；H2 那半是 `Agent._createH2Session` 订阅 session 的 'keylog'）。实测（2026-10-23，#58+#61 修完）：H1 与 H2 各 **5 行**，首行 `CLIENT_HANDSHAKE_TRAFFIC_SECRET …`，不开 `keylog` 时 **0 行**。曾经的两个静默断点都记在 `probe_h2_features` 的注释里：https 层的选项转发表漏了 `keylog`；原生把 H2 的行发成 socket 通道的号（`10`）而 session 通道听的是 `28`。 |
 
 ## 4. `https.Server` API
 
@@ -59,4 +59,4 @@ The `https` module now provides full API compatibility. It correctly extends `tl
 - **Inheritance Fix**: `https.Server` now correctly extends `tls.Server`.
 - **Automatic Verification**: Hostname matching is now part of the `connect` lifecycle.
 - **Improved Defaults**: `globalAgent` now aligns with Node.js production defaults.
-- **Enhanced Sockets**: Added `enableTrace()` and `exportKeyingMaterial()`.
+- **Enhanced Sockets**: `exportKeyingMaterial()` on the rustls path (not yet on impersonated); `enableTrace()` 显式抛 `ERR_NOT_SUPPORTED`（BoringSSL 无 `SSL_trace`）。
