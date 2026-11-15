@@ -14,3 +14,6 @@ lib
 *.log
 *.tgz
 package-lock.json
+# M3-T0 兼容矩阵的 vendored 工具包（解析路径上的 node_modules，裸包名靠它们解析）
+!tests/matrix/node_modules/
+!tests/matrix/node_modules/**/node_modules/

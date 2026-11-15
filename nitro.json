@@ -31,5 +31,8 @@
             "Security",
             "CoreFoundation"
         ]
-    }
+    },
+    "ignorePaths": [
+        "**/node_modules"
+    ]
 }
