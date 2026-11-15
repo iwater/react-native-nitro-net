@@ -1,5 +1,10 @@
-import { Duplex, DuplexOptions } from 'readable-stream'
-import { EventEmitter } from 'eventemitter3'
+// `stream` 指向的是同一份实现：宿主侧由内建表提供，RN 侧由本包依赖
+// `"stream": "npm:readable-stream@^4.7.0"`（node 里 core `stream` 恒优先，该依赖对 node 惰性）。
+// ⚠️ 别改回裸 `readable-stream`：那样 RN 上每个包会各自解析到自己那份 ⇒ 跨包 `instanceof` 分叉。
+import { Duplex, DuplexOptions } from 'stream'
+// EventEmitter 基类在运行期选定：宿主有 `events` 用它，没有才回退 `eventemitter3`。
+// 必须是 CJS 垫片（不能用 ESM import），理由见 eventEmitterCompat.js 顶部注释。
+import { EventEmitter } from './eventEmitterCompat'
 import { Buffer } from 'react-native-nitro-buffer'
 
 import { Driver } from './Driver'
@@ -7,6 +12,15 @@ import type { NetSocketDriver, NetServerDriver, NetConfig } from './Net.nitro'
 import { NetSocketEvent, NetServerEvent } from './Net.nitro'
 import { isVerbose, setVerbose, debugLog as loggerDebugLog } from './Logger'
 import { LoopRef } from './loopRef'
+import {
+    alreadyListeningError,
+    assertConnectTarget,
+    isPipeName,
+    normalizeSocketPort,
+    resolveListenTarget,
+    type ListenTarget,
+} from './socketPort'
+import { nextTick } from './nextTick'
 
 // -----------------------------------------------------------------------------
 // Utils
@@ -151,6 +165,58 @@ function setDefaultAutoSelectFamily(family: number): void {
 }
 
 /**
+ * `net.getDefaultAutoSelectFamilyAttemptTimeout()` —— node 默认 `250`。
+ *
+ * ⚠️ 本宿主**没有实现 Happy Eyeballs**（不做双栈竞速），所以这个值只被存下来
+ * 供读写、**不影响连接行为**。留着是为了**表层对齐**：node 上它是公开 API，
+ * 用户/库的 `typeof net.getDefaultAutoSelectFamilyAttemptTimeout === 'function'`
+ * 特征检测会命中（档案 §6.7 的「缺 3」之一）。
+ *
+ * ⚠️ 与相邻的 `getDefaultAutoSelectFamily()` 不同：**那个是宿主有意 mock 的**
+ * （返回 4/6，node 返回 boolean），且有既有测试锁着，
+ * 所以本文件不顺手改它 —— 差异已记入档案，别把它当成本函数的先例。
+ */
+let _autoSelectFamilyAttemptTimeout = 250;
+
+function getDefaultAutoSelectFamilyAttemptTimeout(): number {
+    return _autoSelectFamilyAttemptTimeout;
+}
+
+/**
+ * 校验**照 node 原文的判据**（实测 v22.22.2）：
+ *   · 非 number ⇒ `ERR_INVALID_ARG_TYPE`
+ *     （`'250'` / `null` / `undefined` / `true` 全部走这条）；
+ *   · number 但非整数（`1.5` / `NaN` / `Infinity`）⇒ `ERR_OUT_OF_RANGE`「must be an integer」；
+ *   · 越界（`0` / `-1` / `2**31`）⇒ `ERR_OUT_OF_RANGE`「must be >= 1 && <= 2147483647」。
+ *
+ * ⚠️ **校验之后还有一道下限夹取**（2026-09-25 实测，原先漏了）：有效值域是
+ * `[10, 2147483647]` 而不是 `[1, …]` —— `setTAT(1|2|9|10)` 之后 `get()` 全部返回 `10`，
+ * `11` 才原样存下。但**校验用的下界仍是 `1`**（`setTAT(0)` 抛 `ERR_OUT_OF_RANGE`）。
+ * 两者顺序不能颠倒：先夹取的话 `0` 会被夹成 `10` 而不抛了。
+ * （实测表：1→10, 2→10, 9→10, 10→10, 11→11, 99→99, 100→100, 2147483647→2147483647。）
+ *
+ * ⚠️ **消息文本不逐字对齐 node**：node 的 `ERR_INVALID_ARG_TYPE` 会拼出
+ * `Received type string ('250')` / `Received null` / `Received type boolean (true)`
+ * 这类**按类型分叉**的后缀，复刻它得把 node 的 `inspect` 逻辑搬过来，收益不成比例。
+ * 这里只保证 **`code` 一致**（parity 用例也只断言 code）。要逐字对齐请另开一条。
+ */
+function setDefaultAutoSelectFamilyAttemptTimeout(value: number): void {
+    if (typeof value !== 'number') {
+        throw errWithCode(TypeError, 'ERR_INVALID_ARG_TYPE',
+            `The "value" argument must be of type number. Received ${value === null ? 'null' : typeof value}`);
+    }
+    if (!Number.isInteger(value)) {
+        throw errWithCode(RangeError, 'ERR_OUT_OF_RANGE',
+            `The value of "value" is out of range. It must be an integer. Received ${value}`);
+    }
+    if (value < 1 || value > 2147483647) {
+        throw errWithCode(RangeError, 'ERR_OUT_OF_RANGE',
+            `The value of "value" is out of range. It must be >= 1 && <= 2147483647. Received ${value}`);
+    }
+    _autoSelectFamilyAttemptTimeout = Math.max(value, 10);
+}
+
+/**
  * Ensures that the network module is initialized.
  * If initWithConfig hasn't been called, it will be called with default options.
  */
@@ -159,6 +225,7 @@ function ensureInitialized(): void {
         initWithConfig({});
     }
 }
+
 
 /**
  * Initialize the network module with custom configuration.
@@ -395,6 +462,18 @@ export class Socket extends Duplex {
     private _autoSelectFamily: boolean = false;
     private _timeout: number = 0;
     /**
+     * 连接/握手阶段的超时兜底（#13）。
+     *
+     * node 的 `socket.setTimeout(ms)` 从**调用时刻**起算：`https.request({ timeout })` 的文档
+     * 原话是 "set the timeout before the socket is connected"；实测 node v22 对「accept 后
+     * 一个字节都不发」的服务端，`timeout: 300` 在 TLS 握手期就会发 `'timeout'`。
+     * 本包的原生定时器要等 socket 任务装好（TCP + TLS 都完成）才生效 ⇒ 连接阶段由这个
+     * **JS 定时器**兜住，握手一结束（'connect'/'secureConnect'）就清掉，交还原生。
+     */
+    private _connectTimer: ReturnType<typeof setTimeout> | undefined;
+    /** 连接/握手是否已收敛（connect / secureConnect / error / close 任一）。 */
+    private _connectSettled: boolean = false;
+    /**
      * 在途的原生写。readable-stream 保证任意时刻最多一个 `_write` 在途，
      * 因此它与原生的 WRITTEN/BUSY 事件一一对应，无需关联 ID。
      * 写入经 `driver.write()` 交给原生后，等 WRITTEN 才 `callback(null)`；
@@ -407,6 +486,20 @@ export class Socket extends Duplex {
      * 宿主不支持该能力时（React Native）全部方法 no-op，行为与今天一致。
      */
     private _loopRef = new LoopRef('net.Socket');
+    /**
+     * 这条连接是不是 AF_UNIX（#73）。node 的 `socket.address()` 在 Unix 上返回**空对象**
+     * （libuv 的 getsockname 对未绑定管道拿不到名字，实测客户端与服务端两侧都是 `{}`），
+     * 而**监听器**的 `address()` 才是路径字符串（#71）。两者形状不同，必须分开判。
+     */
+    protected _isUnix: boolean = false;
+    /**
+     * #82：被 `tls.connect({socket})` 收编后指向那个 TLSSocket。
+     * 收编时本对象的 loop ref 已交出去、driver 的事件也被改写 ⇒ 之后 `destroy()`
+     * 必须**转交**给 TLS socket（node 实测：销毁任一侧都会关掉连接）。
+     */
+    _adoptedBy?: any;
+    /** #82：反向引用 —— 本 socket 收编的原 net.Socket（销毁时连带销毁，node 同行为）。 */
+    protected _adoptedRaw?: any;
 
     /** @internal 供 Server accept / tls.Server 包装路径做 ref 转移；外部勿用。 */
     _acquireLoopRef(): void { this._loopRef.acquire(); }
@@ -434,13 +527,15 @@ export class Socket extends Duplex {
         return this.connecting;
     }
     constructor(options?: SocketOptions) {
+        // `readable`/`writable`/`autoDestroy` 是 Duplex 构造函数**运行期**认的开关：
+        // readable-stream 的类型里声明了前两个，`@types/node` 的 `DuplexOptions` 三个都没声明，
+        // 所以这里整体断言（原先是逐行 `@ts-ignore`），传值不变。
         super({
             allowHalfOpen: options?.allowHalfOpen ?? false,
             readable: options?.readable ?? true,
             writable: options?.writable ?? true,
-            // @ts-ignore
             autoDestroy: true
-        });
+        } as DuplexOptions);
 
         if (options?.socketDriver) {
             // Wrapping existing socket (from Server)
@@ -456,6 +551,16 @@ export class Socket extends Duplex {
             ensureInitialized();
             this._driver = Driver.createSocket();
             this._setupEvents();
+            // 连接阶段超时：握手/连上一律清掉（见 `_connectTimer`）。两类 socket 都挂，
+            // 不适用的那个事件永远不来，监听器本身无副作用。
+            const clearConnectTimer = () => {
+                this._connectSettled = true;
+                this._clearConnectTimer();
+            };
+            this.once('connect', clearConnectTimer);
+            this.once('secureConnect', clearConnectTimer);
+            this.once('error', clearConnectTimer);
+            this.once('close', clearConnectTimer);
             // Enable noDelay by default to match Node.js and reduce latency for small writes
             this._driver.setNoDelay(true);
             // Do NOT resume here - socket is not connected yet!
@@ -466,7 +571,7 @@ export class Socket extends Duplex {
 
     on(event: string | symbol, listener: (...args: any[]) => void): this {
         if (event === 'connect' && this._connected) {
-            process.nextTick(listener);
+            nextTick(listener);
             return this;
         }
         const ret = super.on(event, listener);
@@ -477,7 +582,8 @@ export class Socket extends Duplex {
         return ret;
     }
 
-    private _setupEvents() {
+    /** @internal 子类在换过 driver 之后要重新挂事件（#82 的就地升级用）。 */
+    protected _setupEvents() {
         if (!this._driver) return;
         const id = (this._driver as any).id ?? (this._driver as any)._id;
         this._driver.onEvent = (eventType: number, data: ArrayBuffer) => {
@@ -602,7 +708,7 @@ export class Socket extends Duplex {
     }
 
 
-    private _updateAddresses() {
+    protected _updateAddresses() {
         try {
             const local = this._driver?.getLocalAddress();
             if (local) {
@@ -626,7 +732,10 @@ export class Socket extends Duplex {
         }
     }
 
-    address(): { port: number; family: string; address: string } | null {
+    address(): { port?: number; family?: string; address?: string } | null {
+        // node 实测：Unix 连接上 `address()` 是**空对象**（不是 null、也不是 {address,path,family}）。
+        // 监听器则返回路径字符串，那是 Server.address() 的事（#71）。
+        if (this._isUnix) return {};
         if (!this.localAddress) return null;
         return {
             port: this.localPort || 0,
@@ -636,46 +745,23 @@ export class Socket extends Duplex {
     }
 
     connect(options: any, connectionListener?: () => void): this {
-        // 参数校验对齐 Node（实测 v22，见提交说明）：
-        //   无参 / {} / 既无 port 也无 path  → ERR_MISSING_ARGS（TypeError）
-        //   port 存在但既不是 number 也不是 string（含 null）→ ERR_INVALID_ARG_TYPE
-        //   options 本身不是 object/number/string（true、Symbol…）→ ERR_INVALID_ARG_TYPE
+        // 参数校验与 node 逐字对齐（实测 node v24，规则见 socketPort.ts 的 `assertConnectTarget`）。
         // 裸 `options.path` 解引用会抛没有 code 的 TypeError，调用方无法按 code 分支。
-        if (options === undefined || options === null || typeof options === 'boolean') {
-            if (options === undefined) {
-                throw errWithCode(TypeError, 'ERR_MISSING_ARGS',
-                    'The "options" or "port" or "path" argument must be specified');
-            }
-            throw errWithCode(TypeError, 'ERR_INVALID_ARG_TYPE',
-                `The "options.port" property must be one of type number or string. Received ${options === null ? 'null' : `type boolean (${options})`}`);
-        }
-        if (typeof options !== 'object' && typeof options !== 'number' && typeof options !== 'string') {
-            throw errWithCode(TypeError, 'ERR_MISSING_ARGS',
-                'The "options" or "port" or "path" argument must be specified');
-        }
+        assertConnectTarget(options);
 
-        if (typeof options === 'object') {
-            const hasPort = options.port !== undefined;
-            const hasPath = options.path !== undefined && options.path !== null;
-            if (!hasPort && !hasPath) {
-                throw errWithCode(TypeError, 'ERR_MISSING_ARGS',
-                    'The "options" or "port" or "path" argument must be specified');
-            }
-            if (hasPort && typeof options.port !== 'number' && typeof options.port !== 'string') {
-                throw errWithCode(TypeError, 'ERR_INVALID_ARG_TYPE',
-                    `The "options.port" property must be one of type number or string. Received ${options.port === null ? 'null' : 'an instance of Object'}`);
-            }
-        }
-
-        if (typeof options === 'string') {
-            // Path?
-            if (isNaN(Number(options))) {
-                return this._connectUnix(options, connectionListener);
-            }
+        // 谓词与 listen 侧、与 node 都是同一个 `isPipeName`（实测 node v22.11：
+        // `net.connect('-1')` 是**路径**（异步 ENOENT 'connect ENOENT -1'），`('5')` 是**端口**
+        // （ECONNREFUSED），`('abc')` 是路径）。原先这里写的是 `isNaN(Number(options))`，
+        // 于是 '-1' 落到端口分支并被 normalizeSocketPort 同步抛 ERR_SOCKET_BAD_PORT。
+        if (typeof options === 'string' && isPipeName(options)) {
+            return this._connectUnix(options, connectionListener);
         }
 
         if (typeof options === 'number' || typeof options === 'string') {
-            const port = Number(options);
+            // 必须走 `normalizeSocketPort` 而不是 `Number(options)`：后者先把 `''` 归成 0，
+            // 于是 node 的 `ERR_SOCKET_BAD_PORT`（实测：`Port should be >= 0 and < 65536.
+            // Received type string ('')。`）在我们这里变成"接受并连端口 0"。
+            const port = normalizeSocketPort(options);
             const host = (arguments.length > 1 && typeof arguments[1] === 'string') ? arguments[1] : 'localhost';
             // connect(port[, host][, cb]) 的回调位置随参数个数变化，必须在 arguments 上看：
             //   (port, cb)        → arguments[1] 是函数
@@ -723,7 +809,7 @@ export class Socket extends Duplex {
             return this._failClosed();
         }
         if (signal?.aborted) {
-            process.nextTick(() => this.emit('error', new Error('The operation was aborted')));
+            nextTick(() => this.emit('error', new Error('The operation was aborted')));
             return this;
         }
         this.connecting = true;
@@ -738,11 +824,18 @@ export class Socket extends Duplex {
             this.once('close', () => signal.removeEventListener('abort', abortHandler));
         }
 
+        // Nitro 驱动只收**数字**端口，且归一必须排在 handle-ref 登记**之前**：端口非法就同步
+        // 抛出，不能留下顶着 loop 的 ref。字符串端口（`url.parse()` / `new URL()` 交出来的
+        // 就是字符串，node-fetch / follow-redirects 全走这条路）原先会一路走到内核边界，在
+        // 计时器回调里抛 `NetSocketDriver.connect(...): Value is a string, expected a number`
+        // —— 报完还挂住进程（M3-T0 矩阵 F2 的真实阻塞点）。判据与共用实现见 socketPort.ts。
+        const portNumber = normalizeSocketPort(port);
+
         // 过完全部早退守卫之后才登记 handle-ref：没真的发起连接就不该顶住 loop。
-        // 释放出口是 _destroy（'close' 的唯一来源）与 resetAndDestroy。
+        // 释放出口是 _destroy（'close' 的唯一出口）与 resetAndDestroy。
         this._loopRef.acquire();
-        debugLog(`Socket._connect: Calling driver.connect(${host}, ${port})`);
-        this._driver?.connect(host, port);
+        debugLog(`Socket._connect: Calling driver.connect(${host}, ${portNumber})`);
+        this._driver?.connect(host, portNumber);
         return this;
     }
 
@@ -754,9 +847,6 @@ export class Socket extends Duplex {
     private _failClosed(): this {
         this.connecting = false;
         const err = errWithCode(Error, 'ERR_SOCKET_CLOSED', 'Socket is closed');
-        const nextTick = typeof process !== 'undefined' && process.nextTick
-            ? process.nextTick.bind(process)
-            : (fn: () => void) => setTimeout(fn, 0);
         nextTick(() => this.emit('error', err));
         return this;
     }
@@ -765,7 +855,7 @@ export class Socket extends Duplex {
         if (this.connecting || this._connected) return this;
         if (!this._driver) return this._failClosed();
         if (signal?.aborted) {
-            process.nextTick(() => this.emit('error', new Error('The operation was aborted')));
+            nextTick(() => this.emit('error', new Error('The operation was aborted')));
             return this;
         }
         this.connecting = true;
@@ -781,6 +871,7 @@ export class Socket extends Duplex {
         }
 
         this._loopRef.acquire();
+        this._isUnix = true;
         this._driver?.connectUnix(path);
         return this;
     }
@@ -808,6 +899,29 @@ export class Socket extends Duplex {
     write(chunk: any, cb?: (error: Error | null | undefined) => void): boolean;
     write(chunk: any, encoding?: string, cb?: (error: Error | null | undefined) => void): boolean;
     write(chunk: any, encoding?: any, callback?: any): boolean {
+        // 对齐 Node：**已销毁的 socket 上 write 是静默 no-op**。
+        //
+        // Node 的 `Writable.write` 在 `state.destroyed` 时走
+        // `errorOrDestroy(stream, ERR_STREAM_DESTROYED, /*sync*/ true)`，而
+        // `errorOrDestroy` 的第一句就是 `if (w && w.destroyed) return this;`
+        // —— 已销毁 ⇒ 既不发 'error' 也不抛，只是 `nextTick(cb, err)` 后返回 false。
+        // 实测（node v22.22.2）：`new net.Socket().destroy()` 之后 `s.write('x')`
+        // 返回 false，无异常、无 'error' 事件。
+        //
+        // ⚠️ readable-stream 里也有同名的 destroyed 分支，但它的 `errorOrDestroy`
+        // 语义不同 —— 实测后果是：**客户端中途断开 → 服务端稍后写响应** 会变成
+        // 未捕获的 `ERR_STREAM_DESTROYED`（整个进程崩）。Node 下同样的场景静默通过。
+        if (this.destroyed) {
+            if (typeof encoding === 'function') {
+                callback = encoding;
+            }
+            if (typeof callback === 'function') {
+                nextTick(callback, errWithCode(
+                    Error, 'ERR_STREAM_DESTROYED',
+                    'Cannot call write after a stream was destroyed'));
+            }
+            return false;
+        }
         const ret = super.write(chunk, encoding, callback);
         // 原生写通道仍有在途写（等 WRITTEN/BUSY 裁决）时，如实返回 false 作为背压信号
         return this._pendingNativeWrite ? false : ret;
@@ -851,7 +965,13 @@ export class Socket extends Duplex {
         try {
             const buffer = (chunk instanceof Buffer) ? chunk : Buffer.from(chunk, encoding as any);
             this.bytesWritten += buffer.length;
-            const ab = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+            // 视图正好覆盖整个 ArrayBuffer 时（`Buffer.from(...)` 的常见产物：
+            // byteOffset=0 且 byteLength 相等）不必再切一份副本。
+            // ⚠️ 判据不能省：`chunk` 已经是 Buffer 时它可能只是别人 ArrayBuffer 上的
+            // 一个视图，直接把整个 ArrayBuffer 交出去会写出多余的字节。
+            const ab = (buffer.byteOffset === 0 && buffer.byteLength === buffer.buffer.byteLength)
+                ? buffer.buffer
+                : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
             debugLog(() => `Socket _write, len: ${ab.byteLength}`);
             // 不改回立即 callback(null)：交给原生裁决
             //   WRITTEN(5) → callback(null) 放行下一条
@@ -909,6 +1029,21 @@ export class Socket extends Duplex {
 
     _destroy(err: Error | null, callback: (error: Error | null) => void) {
         debugLog(`Socket (localPort: ${this.localPort}) ._destroy() called`);
+        // #82：已被就地升级收编 ⇒ 连接归 TLS socket 所有，销毁转交（node 同行为）。
+        if (this._adoptedBy) {
+            const tls = this._adoptedBy
+            this._adoptedBy = undefined
+            this._connected = false
+            this.connecting = false
+            this.destroyed = true
+            try {
+                tls.destroy()
+            } catch {
+                // 已经销毁过，忽略
+            }
+            callback(err);
+            return;
+        }
         // 'close' 的唯一出口 —— handle-ref 在这里归零（Node：handle 销毁即 unref）
         this._loopRef.release();
         this._connected = false;
@@ -923,6 +1058,18 @@ export class Socket extends Duplex {
         if (this._driver) {
             this._driver.destroy();
             this._driver = undefined;
+        }
+        // #82：就地升级的 TLS socket 销毁时，原 net.Socket 也要销毁（node 实测：raw 会
+        // 收到 'close'、`raw.destroyed` 变 true）。先断开转交关系，避免它再回调回来。
+        if (this._adoptedRaw) {
+            const raw = this._adoptedRaw
+            this._adoptedRaw = undefined
+            raw._adoptedBy = undefined
+            try {
+                raw.destroy()
+            } catch {
+                // 已经销毁过，忽略
+            }
         }
         callback(err);
     }
@@ -942,8 +1089,29 @@ export class Socket extends Duplex {
         if (this._driver) {
             this._driver.setTimeout(msecs);
         }
+        this._armConnectTimer();
         if (callback) this.once('timeout', callback);
         return this;
+    }
+
+    /** 见 `_connectTimer`：只在「还在连接、且设了超时」时武装，settle 时清掉。 */
+    private _armConnectTimer(): void {
+        this._clearConnectTimer();
+        // 用「是否已收敛」而不是 `connecting` 判断：https 的 TLSSocket 在 TCP 连上之后、
+        // 握手完成之前 `connecting` 可能已经是 false，而那正是要覆盖的阶段。
+        if (!(this._timeout > 0) || this._connectSettled) return;
+        this._connectTimer = setTimeout(() => {
+            this._connectTimer = undefined;
+            // node 的 'timeout' **不**销毁 socket（实测 `destroyed === false`），由调用方决定
+            this.emit('timeout');
+        }, this._timeout);
+    }
+
+    private _clearConnectTimer(): void {
+        if (this._connectTimer !== undefined) {
+            clearTimeout(this._connectTimer as any);
+            this._connectTimer = undefined;
+        }
     }
 
     /**
@@ -1047,6 +1215,29 @@ export class Server extends EventEmitter {
     private _dropMaxConnection: boolean = false;
     /** server 级连接超时（毫秒，0 = 不设）；在 _trackSocket 里套用到每条新连接 */
     private _timeout: number = 0;
+    /**
+     * Unix socket 监听路径。node 的 `server.address()` 对 pipe 监听返回**路径字符串**，
+     * 而 `getLocalAddress()` 只给 host:port 形态（解析不出 ⇒ address() 返回 null ⇒
+     * `server.listening` 也是假的）。CLOSE 时清掉，否则关掉的 server 还自称在听。
+     */
+    protected _listenPath: string | undefined;
+    /** 是否收到过 native 的 listen 成功回执（'listening' 已经发过）。ERROR 分支用它判断要不要归零。 */
+    protected _sawListening: boolean = false;
+    /**
+     * #81：node 的 `_handle` 在**一部分** listen 形式里是**同步**创建的 ——
+     * 端口（无 host）、pipe 路径、已有 fd 三种；带 host 时 node 走 `dns.lookup`，
+     * `_handle` 要等回调，所以**同一 tick 内的第二次 listen 在 node 不抛**（实测 v22.11：
+     * `listen(0); listen(0)` 抛，而 `listen(0,'127.0.0.1'); listen(0)` 不抛）。
+     * 我们的 native listen 一律异步，只能在 JS 侧模拟那三种"同步拿到 handle"的形态。
+     */
+    protected _listenHandlePending: boolean = false;
+    /**
+     * #81：node 的 `close()` **同步**把 `_handle` 置空 ⇒ `listening` 立刻变 false、
+     * 且**立刻重听**是受支持路径（R07 变体 A 就是这条契约）。我们的 `close()` 只发
+     * native 关闭请求，CLOSE 事件才清状态；这里用一个同步旗标补上"已请求关闭"这一段，
+     * 否则重听会被"已在 listening"的闸门误拒。
+     */
+    private _closeRequested: boolean = false;
 
     /**
      * 设置入站连接的超时（Node 的 `net.Server.setTimeout` 语义）。
@@ -1081,10 +1272,9 @@ export class Server extends EventEmitter {
     }
 
     get listening(): boolean {
-        // If we have a driver and we assume it's listening if it has been started?
-        // Actually, checking _driver state might be hard if not exposed.
-        // But typically 'listening' is true after 'listening' event.
-        // We can track it with a private flag or by checking address() which returns null if not listening.
+        // node 的 `close()` 同步把 `_handle` 置空 ⇒ `listening` 立刻变 false。
+        // 我们只发 native 关闭请求（CLOSE 事件才清地址），所以用同步旗标补这一段。
+        if (this._closeRequested) return false;
         return !!this.address();
     }
 
@@ -1143,6 +1333,8 @@ export class Server extends EventEmitter {
                 case NetServerEvent.CONNECTION: {
                     const payload = decodeArrayBuffer(data);
                     if (payload === 'success') {
+                        this._sawListening = true;
+                        this._listenHandlePending = false;
                         this.emit('listening');
                     } else {
                         const clientId = payload;
@@ -1187,6 +1379,8 @@ export class Server extends EventEmitter {
                             // Initialize addresses immediately for server-side socket
                             // @ts-ignore
                             socket._updateAddresses();
+                            // @ts-ignore
+                            socket._isUnix = this._listenPath !== undefined;
                             debugLog(`Socket initialized addresses: local=${socket.localAddress}:${socket.localPort}, remote=${socket.remoteAddress}:${socket.remotePort}`);
 
                             // accepted socket 持有 handle（Node 语义）；释放走 _destroy。
@@ -1201,10 +1395,25 @@ export class Server extends EventEmitter {
                     }
                     break;
                 }
+                case NetServerEvent.H2_SESSION: {
+                    // M5-3：明文/TLS accept 分流到了 h2 引擎。JS 侧取的是**已建好**
+                    // 的 session 对象（C++ 在转发本事件前就构造并注册了它，首帧不会丢）。
+                    const text = decodeArrayBuffer(data)
+                    const sessionId = Number(text)
+                    if (sessionId > 0) this.emit('h2session', sessionId)
+                    break
+                }
                 case NetServerEvent.ERROR:
                     // listen 失败（EADDRINUSE 等）时 'close' 不一定来 —— 这条路径必须
                     // 自己归零，否则 server 的 ref 泄漏、进程永不退出。
-                    if (!this.listening) this._loopRef.release();
+                    // 用「收到过 listen 成功回执」判定，不能用 `this.listening`：unix 监听的
+                    // address() 是 `_listenPath`（本地地址解析不出来），绑定失败时它照样非空。
+                    if (!this._sawListening) {
+                        this._listenPath = undefined;
+                        // 绑定失败 ⇒ handle 没建成，node 允许重试（#81 的 pending 标记要一起清）
+                        this._listenHandlePending = false;
+                        this._loopRef.release();
+                    }
                     this.emit('error', enrichSystemError(new Error(decodeArrayBuffer(data) || 'Unknown server error')));
                     break;
                 case NetServerEvent.DEBUG: {
@@ -1215,6 +1424,10 @@ export class Server extends EventEmitter {
                 case NetServerEvent.CLOSE:
                     // handle 销毁即 unref。必须在 emit 之前：'close' 回调里可能再
                     // 建新 handle，顺序反了会短暂误判为「还有活 handle」。
+                    this._sawListening = false;
+                    this._listenHandlePending = false;
+                    this._closeRequested = false;
+                    this._listenPath = undefined;
                     this._loopRef.release();
                     this.emit('close');
                     break;
@@ -1248,7 +1461,21 @@ export class Server extends EventEmitter {
         });
     }
     listen(port?: any, host?: any, backlog?: any, callback?: any): this {
-        let _port = 0;
+        // #81：node 在**已经 listening**（`_handle` 存在）时再来一次 listen 会同步抛
+        // `ERR_SERVER_ALREADY_LISTEN`（实测 v22.11：普通 Error，消息
+        // "Listen method has been called more than once without closing."）。
+        // 注意判据：node 对"首次 listen 还没完成"时的再次调用**不抛**（实测同步连调两次
+        // `listen(0)` 无异常，第二次顶掉待处理绑定）—— 所以看的是"已经 listening"，
+        // 不是"调用过 listen"。我们的等价值是 `_sawListening`（'listening' 时置位、CLOSE 清）。
+        // 判据是"已经有 handle"，不是"调用过 listen"；而 close() 在 node 里同步把
+        // `_handle` 置空 ⇒ **close 之后立刻重听是受支持路径**（R07 变体 A 的契约），
+        // 所以 `_closeRequested` 期间不拦（重听会把旗标清掉）。
+        if (!this._closeRequested && (this._sawListening || this._listenHandlePending)) {
+            throw alreadyListeningError();
+        }
+        this._closeRequested = false;
+
+        let _port: unknown = 0;
         let _host: string | undefined;
         let _backlog: number | undefined;
         let _path: string | undefined;
@@ -1257,8 +1484,17 @@ export class Server extends EventEmitter {
         let ipv6Only = false;
         let reusePort = false;
         let handle: { fd?: number } | undefined;
+        // node 的 normalizeArgs 视角（闸门要用，见 socketPort.ts 的 resolveListenTarget）：
+        // `hasPort` 是 `'port' in options`，位置参数形式也算；`omitted` 是「无参或首参是回调」。
+        let hasPort = false;
+        let hasPath = false;
+        const omitted = arguments.length === 0 || typeof port === 'function';
+        let normalizedOptions: unknown;
 
         if (typeof port === 'object' && port !== null) {
+            normalizedOptions = port;
+            hasPort = 'port' in port;
+            hasPath = 'path' in port;
             // Check if it's a handle object with fd property
             if (typeof port.fd === 'number') {
                 handle = port;
@@ -1275,11 +1511,23 @@ export class Server extends EventEmitter {
                 _callback = host; // listen(options, cb)
             }
         } else {
-            _port = typeof port === 'number' ? port : (typeof port === 'string' && !isNaN(Number(port)) ? Number(port) : 0);
-            if (typeof port === 'string' && isNaN(Number(port))) _path = port;
+            // node 的 normalizeArgs：首参是 pipe 名（非空、`Number()` 不是 `>=0` 的字符串）时
+            // 进 `options.path`，**不是** `options.port` —— 之前这里把路径当端口归 0 了。
+            const isPath = isPipeName(port);
+            _port = isPath ? undefined : port;
+            _path = isPath ? port : undefined;
+            hasPort = !isPath;
+            hasPath = isPath;
+            normalizedOptions = isPath ? { path: port } : { port };
+            // `listen(cb)`：node 的 normalizeArgs 取**末位**函数当回调，同时把首参（那个函数）
+            // 归一成 port=0。原来只查 `host`/`backlog`/`callback` 三个位置，回调被整个丢掉
+            // ——调用方永远等不到 'listening'。
+            if (typeof port === 'function') _callback = port;
 
-            if (typeof host === 'string') _host = host;
-            else if (typeof host === 'function') _callback = host;
+            if (typeof host === 'string') {
+                _host = host;
+                if (hasPort) (normalizedOptions as any).host = host;
+            } else if (typeof host === 'function') _callback = host;
 
             if (typeof backlog === 'number') _backlog = backlog;
             else if (typeof backlog === 'function') _callback = backlog;
@@ -1287,10 +1535,24 @@ export class Server extends EventEmitter {
             if (typeof callback === 'function') _callback = callback;
         }
 
+        // fd/handle 形式在 node 里同样早退（不做端口校验）。其余一律过闸门：
+        // 抛出必须发生在 `_loopRef.acquire()` **之前**，且绝不能把非法端口递到 native。
+        const target: ListenTarget = handle ? {} : resolveListenTarget({
+            port: _port,
+            path: _path,
+            hasPort,
+            hasPath,
+            omitted,
+            options: normalizedOptions,
+        });
+        _port = target.port;
+        _path = target.path;
+        this._listenPath = target.path;
+
         if (_callback) this.once('listening', _callback);
 
         if (signal?.aborted) {
-            process.nextTick(() => this.emit('error', new Error('The operation was aborted')));
+            nextTick(() => this.emit('error', new Error('The operation was aborted')));
             return this;
         }
 
@@ -1307,6 +1569,9 @@ export class Server extends EventEmitter {
         // listening 的 server 持有 handle（Node 语义）→ 在调 native 之前登记。
         // 同步抛错则回退登记再重抛：没有 handle 就不该留下 ref。
         this._loopRef.acquire();
+        // #81：node 在 fd / pipe / 端口（无 host）三种形态里**同步**建好 `_handle`，
+        // 带 host 时它先 `dns.lookup` ⇒ 同一 tick 的第二次 listen **不抛**（实测）。
+        this._listenHandlePending = handle !== undefined || !!_path || _host === undefined;
         try {
             if (handle && typeof handle.fd === 'number') {
                 // Listen on an existing file descriptor (handle)
@@ -1315,9 +1580,11 @@ export class Server extends EventEmitter {
                 this._driver.listenUnix(_path, _backlog);
             } else {
                 // _host 透传（Node 语义：listen(port, host) 绑定指定地址；undefined 时绑通配）
-                this._driver.listen(_port || 0, _host, _backlog, ipv6Only, reusePort);
+                // 端口已由 resolveListenTarget 归一成 number（fd/handle 形式除外 → 0）。
+                this._driver.listen((_port as number) || 0, _host, _backlog, ipv6Only, reusePort);
             }
         } catch (e) {
+            this._listenHandlePending = false;
             this._loopRef.release();
             throw e;
         }
@@ -1343,6 +1610,8 @@ export class Server extends EventEmitter {
      * 自己监听各连接的 `'close'`，或先 `closeAllConnections()`。
      */
     close(callback?: (err?: Error) => void): this {
+        // node：`_handle = null` 同步发生 ⇒ listening 立刻 false、可立刻重听。
+        this._closeRequested = true;
         this._driver.close();
         if (callback) this.once('close', callback);
         return this;
@@ -1362,7 +1631,10 @@ export class Server extends EventEmitter {
         this._connections = 0;
     }
 
-    address(): { port: number; family: string; address: string } | null {
+    address(): { port: number; family: string; address: string } | string | null {
+        // Unix socket 监听：node 的 address() 返回**路径字符串**（`getsockname()` 对 pipe
+        // handle 就是这个形态），不是 {port,family,address} 对象。
+        if (this._listenPath) return this._listenPath;
         try {
             const addr = this._driver.getLocalAddress();
             if (addr) {
@@ -1478,9 +1750,15 @@ export {
     isIPv6,
     getDefaultAutoSelectFamily,
     setDefaultAutoSelectFamily,
+    getDefaultAutoSelectFamilyAttemptTimeout,
+    setDefaultAutoSelectFamilyAttemptTimeout,
     isVerbose,
     setVerbose,
     initWithConfig,
+    // ⚠️ `net.Stream` 是 **`Socket` 的别名**（同一个类对象），不是子类 ——
+    // node 实测 `net.Stream === net.Socket` 为 `true`，用户拿它做 `instanceof` 检查。
+    // 所以这里必须是**同一个引用**的再导出，不能 `class Stream extends Socket`。
+    Socket as Stream,
 };
 
 export type { NetConfig };
@@ -1498,7 +1776,10 @@ export default {
     isIPv6,
     getDefaultAutoSelectFamily,
     setDefaultAutoSelectFamily,
+    getDefaultAutoSelectFamilyAttemptTimeout,
+    setDefaultAutoSelectFamilyAttemptTimeout,
     setVerbose,
     initWithConfig,
     networkInterfaces,
+    Stream: Socket,
 };
