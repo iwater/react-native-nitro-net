@@ -1,8 +1,12 @@
 #pragma once
 
 #include "../nitrogen/generated/shared/c++/HybridNetServerDriverSpec.hpp"
+#include "HybridHttp2ServerSessionDriver.hpp"
 #include "NetBindings.hpp"
 #include "NetManager.hpp"
+#include <cmath>
+#include <deque>
+#include <stdexcept>
 #include <NitroModules/ArrayBuffer.hpp>
 #include <memory>
 #include <optional>
@@ -54,12 +58,15 @@ public:
 
   void listenTLS(double port, double secureContextId,
                  std::optional<double> backlog, std::optional<bool> ipv6Only,
-                 std::optional<bool> reusePort) override {
+                 std::optional<bool> reusePort,
+                 const std::optional<std::string> &host) override {
     ensureServerId();
+    // #83：host 追加在末尾（与 nitro spec 一致）；nullopt ⇒ 绑通配（node：`::` 双栈）
     net_listen_tls(_id, static_cast<int>(port),
                    static_cast<int>(backlog.value_or(128)),
                    ipv6Only.value_or(false), reusePort.value_or(false),
-                   static_cast<uint32_t>(secureContextId));
+                   static_cast<uint32_t>(secureContextId),
+                   host ? host->c_str() : nullptr);
   }
 
   void listenUnix(const std::string &path,
@@ -80,6 +87,29 @@ public:
     ensureServerId();
     net_listen_handle(_id, static_cast<int>(fd),
                       static_cast<int>(backlog.value_or(128)));
+  }
+
+  // M5-3：accept 分流模式（0=off，1=只接 h2，2=h2 + HTTP/1.1 回退），listen 前调用。
+  void setHttp2Mode(double mode) override {
+    if (_id == 0) {
+      return;
+    }
+    if (!std::isfinite(mode) || mode < 0.0 || mode > 2.0) {
+      throw std::invalid_argument(
+          "ERR_INVALID_ARG_VALUE: http2 mode must be 0, 1 or 2");
+    }
+    net_set_http2_mode(_id, static_cast<uint8_t>(mode));
+  }
+
+  // M5-3：取出原生 accept 时创建的 h2 session（每收到一个 `h2session` 事件取一次）。
+  std::shared_ptr<HybridHttp2ServerSessionDriverSpec> takeHttp2Session() override {
+    if (_pendingH2Sessions.empty()) {
+      throw std::runtime_error(
+          "ERR_INVALID_STATE: no pending http2 session for this server");
+    }
+    auto session = _pendingH2Sessions.front();
+    _pendingH2Sessions.pop_front();
+    return session;
   }
 
   std::string getLocalAddress() override {
@@ -164,6 +194,23 @@ private:
     // 那样对象会在回调中被析构，回调之后的 _id / destroy() 就落在已释放对象上。
     auto self = shared_from_this();
 
+    // M5-3：h2 session 事件 —— 先把 session 对象建出来并注册 handler（它会缓存
+    // 首帧），再通知 JS 调 takeHttp2Session()。顺序反了会丢首帧。
+    if (type == 7 && data && data->size() > 0) {
+      try {
+        std::string text(reinterpret_cast<const char *>(data->data()),
+                         data->size());
+        auto sessionId = static_cast<uint32_t>(std::stoul(text));
+        if (sessionId != 0) {
+          auto session =
+              std::make_shared<HybridHttp2ServerSessionDriver>(sessionId);
+          session->attach();
+          _pendingH2Sessions.push_back(session);
+        }
+      } catch (const std::exception &e) {
+      }
+    }
+
     _onEvent(static_cast<double>(type), data);
 
     if (type == 4) { // CLOSE
@@ -182,6 +229,7 @@ private:
 
   uint32_t _id;
   double _maxConnections = 0;
+  std::deque<std::shared_ptr<HybridHttp2ServerSessionDriver>> _pendingH2Sessions;
   bool _handlerRegistered = false;
   std::function<void(double, const std::shared_ptr<ArrayBuffer> &)> _onEvent;
 };

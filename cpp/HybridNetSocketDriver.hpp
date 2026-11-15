@@ -90,6 +90,92 @@ public:
     }
   }
 
+  void connectTLSWithProxy(
+      const std::string &host, double port, const std::string &proxyHost,
+      double proxyPort,
+      const std::optional<std::string> &proxyAuthorization,
+      const std::optional<std::string> &serverName,
+      std::optional<bool> rejectUnauthorized,
+      std::optional<double> secureContextId) override {
+    const char *sni = serverName.has_value() ? serverName->c_str() : nullptr;
+    const char *auth =
+        proxyAuthorization.has_value() ? proxyAuthorization->c_str() : nullptr;
+    bool ru = rejectUnauthorized.value_or(true);
+    uint32_t sc = secureContextId.has_value()
+                      ? static_cast<uint32_t>(secureContextId.value())
+                      : 0;
+    net_connect_tls_with_proxy(
+        _id, host.c_str(), static_cast<int>(port), sni, static_cast<int>(ru), sc,
+        proxyHost.c_str(), static_cast<int>(proxyPort), auth);
+  }
+
+  void connectTLSWithHttpsProxy(
+      const std::string &host, double port, const std::string &proxyHost,
+      double proxyPort,
+      const std::optional<std::string> &proxyAuthorization,
+      const std::optional<std::string> &serverName,
+      std::optional<bool> rejectUnauthorized,
+      std::optional<double> secureContextId,
+      const std::optional<std::string> &proxyServerName,
+      std::optional<bool> proxyRejectUnauthorized,
+      std::optional<double> proxySecureContextId) override {
+    const char *sni = serverName.has_value() ? serverName->c_str() : nullptr;
+    const char *auth =
+        proxyAuthorization.has_value() ? proxyAuthorization->c_str() : nullptr;
+    const char *proxySni =
+        proxyServerName.has_value() ? proxyServerName->c_str() : nullptr;
+    net_connect_tls_with_https_proxy(
+        _id, host.c_str(), static_cast<int>(port), sni,
+        rejectUnauthorized.value_or(true) ? 1 : 0,
+        secureContextId.has_value()
+            ? static_cast<uint32_t>(secureContextId.value())
+            : 0,
+        proxyHost.c_str(), static_cast<int>(proxyPort), auth, proxySni,
+        proxyRejectUnauthorized.value_or(true) ? 1 : 0,
+        proxySecureContextId.has_value()
+            ? static_cast<uint32_t>(proxySecureContextId.value())
+            : 0);
+  }
+
+  void connectTLSWithProfile(
+      const std::string &host, double port,
+      const std::optional<std::string> &serverName,
+      const std::string &profileJson, const std::string &optionsJson,
+      const std::optional<std::string> &proxyJson) override {
+    net_connect_tls_with_profile(
+        _id, host.c_str(), static_cast<int>(port),
+        serverName.has_value() ? serverName->c_str() : nullptr,
+        profileJson.c_str(), optionsJson.c_str(),
+        proxyJson.has_value() ? proxyJson->c_str() : nullptr);
+  }
+
+  bool impersonationAvailable() override {
+    return net_impersonation_available();
+  }
+
+  void connectTLSWithSocks(
+      const std::string &host, double port, const std::string &proxyHost,
+      double proxyPort, double proxyVersion,
+      const std::optional<std::string> &proxyUsername,
+      const std::optional<std::string> &proxyPassword,
+      const std::optional<std::string> &serverName,
+      std::optional<bool> rejectUnauthorized,
+      std::optional<double> secureContextId) override {
+    const char *sni = serverName.has_value() ? serverName->c_str() : nullptr;
+    const char *user =
+        proxyUsername.has_value() ? proxyUsername->c_str() : nullptr;
+    const char *pass =
+        proxyPassword.has_value() ? proxyPassword->c_str() : nullptr;
+    bool ru = rejectUnauthorized.value_or(true);
+    uint32_t sc = secureContextId.has_value()
+                      ? static_cast<uint32_t>(secureContextId.value())
+                      : 0;
+    net_connect_tls_with_socks(
+        _id, host.c_str(), static_cast<int>(port), sni, static_cast<int>(ru), sc,
+        proxyHost.c_str(), static_cast<int>(proxyPort),
+        static_cast<int>(proxyVersion), user, pass);
+  }
+
   // 以下 getter 统一用"两次调用"模式：先以 (nullptr, 0) 只查长度，再按长度精确分配。
   // 直接把定长栈缓冲区交给原生是不安全的：Rust 侧在缓冲区不足时不拷贝、但仍然返回
   // 真实长度，若按返回长度去构造 string / ArrayBuffer，就会越界读取未初始化的栈内存
@@ -123,6 +209,17 @@ public:
       return std::nullopt;
     std::vector<char> buf(len + 1);
     size_t got = net_get_cipher(_id, buf.data(), buf.size());
+    if (got == 0 || got > len)
+      return std::nullopt;
+    return std::string(buf.data(), got);
+  }
+
+  std::optional<std::string> getCipherStandardName() override {
+    size_t len = net_get_cipher_standard_name(_id, nullptr, 0);
+    if (len == 0)
+      return std::nullopt;
+    std::vector<char> buf(len + 1);
+    size_t got = net_get_cipher_standard_name(_id, buf.data(), buf.size());
     if (got == 0 || got > len)
       return std::nullopt;
     return std::string(buf.data(), got);
@@ -339,6 +436,14 @@ public:
     (void)rejectUnauthorized;
     (void)secureContextId;
 #endif
+  }
+
+  // #82：在已连接的明文 socket 上就地升级为 TLS。结果走事件通道：
+  // 成功 NET_EVENT_TLS_READY(30)、失败 NET_EVENT_ERROR(3)。
+  void startTLS(const std::string &serverName, bool rejectUnauthorized,
+                double secureContextId) override {
+    net_starttls(_id, serverName.c_str(), rejectUnauthorized,
+                 static_cast<uint32_t>(secureContextId));
   }
 
 private:

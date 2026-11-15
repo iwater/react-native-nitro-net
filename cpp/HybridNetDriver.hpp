@@ -3,6 +3,7 @@
 #include "../nitrogen/generated/shared/c++/HybridHttpParserSpec.hpp"
 #include "../nitrogen/generated/shared/c++/HybridNetDriverSpec.hpp"
 #include "HybridHttpParser.hpp"
+#include "HybridHttp2SessionDriver.hpp"
 #include "HybridNetServerDriver.hpp"
 #include "HybridNetSocketDriver.hpp"
 #include "NetManager.hpp"
@@ -28,6 +29,10 @@ public:
         margelo::nitro::Dispatcher::getRuntimeGlobalDispatcher(runtime);
     NetManager::shared().setDispatcher(dispatcher);
     return jsi::Value::undefined();
+  }
+
+  bool impersonationAvailable() override {
+    return net_impersonation_available();
   }
 
   void loadHybridMethods() override {
@@ -71,6 +76,12 @@ public:
     return std::make_shared<HybridHttpParser>(static_cast<int>(mode));
   }
 
+  bool http2Available() override { return net_http2_available(); }
+
+  std::shared_ptr<HybridHttp2SessionDriverSpec> createHttp2Session() override {
+    return std::make_shared<HybridHttp2SessionDriver>();
+  }
+
   double
   createSecureContext(const std::string &cert, const std::string &key,
                       const std::optional<std::string> &passphrase) override {
@@ -85,6 +96,12 @@ public:
 
   void addCACertToSecureContext(double scId, const std::string &ca) override {
     net_secure_context_add_ca(static_cast<uint32_t>(scId), ca.c_str());
+  }
+
+  void setClientAuthToSecureContext(double scId, bool requestCert,
+                                    bool rejectUnauthorized) override {
+    net_secure_context_set_client_auth(static_cast<uint32_t>(scId), requestCert,
+                                       rejectUnauthorized);
   }
 
   void addContextToSecureContext(
@@ -112,6 +129,17 @@ public:
     if (ocsp) {
       net_secure_context_set_ocsp_response(static_cast<uint32_t>(scId),
                                            ocsp->data(), ocsp->size());
+    }
+  }
+
+  // #84：服务端 ALPN（线缆形态由 JS 侧 convertALPNProtocols 生成）。
+  // 与 OCSP 不同，`size() == 0` 是**合法**输入（node 的 `ALPNProtocols: []`），
+  // 所以这里只挡空指针，不能照抄 OCSP 的 `len == 0` 早退。
+  void setAlpnProtocolsToSecureContext(
+      double scId, const std::shared_ptr<ArrayBuffer> &protocols) override {
+    if (protocols) {
+      net_secure_context_set_alpn(static_cast<uint32_t>(scId),
+                                  protocols->data(), protocols->size());
     }
   }
 
